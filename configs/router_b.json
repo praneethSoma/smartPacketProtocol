@@ -1,0 +1,19 @@
+{
+  "Name": "router_b",
+  "ListenAddr": "10.0.2.2:8002",
+  "GossipPort": 7002,
+  "ProbeIntervalMs": 100,
+  "GossipIntervalMs": 50,
+  "Neighbors": {
+    "router_a": {
+      "DataAddr": "10.0.2.1:8001",
+      "GossipAddr": "10.0.2.1:7001",
+      "ProbeAddr": "10.0.2.1:6001"
+    },
+    "receiver": {
+      "DataAddr": "10.0.4.2:9000",
+      "GossipAddr": "10.0.4.2:7004",
+      "ProbeAddr": "10.0.4.2:6004"
+    }
+  }
+}

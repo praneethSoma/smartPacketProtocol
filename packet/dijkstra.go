@@ -1,0 +1,274 @@
+package packet
+
+import (
+	"math"
+)
+
+// ──────────────────────────────────────────────────────────────
+// Weight configuration — the "brain" of intent-aware routing.
+//
+// These multipliers control how much latency, load, and loss
+// influence the Dijkstra edge weights for each intent level.
+// They are the core tuning knobs of the SPP routing engine.
+// ──────────────────────────────────────────────────────────────
+
+// WeightConfig holds the multipliers used by calculateWeight to convert
+// raw link metrics (latency, load, loss) into a single composite edge
+// weight for Dijkstra. Different intent levels apply different multipliers,
+// making the same physical link appear "heavier" or "lighter" depending
+// on what the packet needs.
+type WeightConfig struct {
+	// Latency multipliers per intent level (index 0=relaxed … 3=critical).
+	// Higher values make Dijkstra penalize high-latency links more.
+	LatencyMultiplier [4]float64
+
+	// Load multipliers per intent level (index 0=relaxed … 3=critical).
+	// Higher values make Dijkstra penalize high-load links more.
+	LoadMultiplier [4]float64
+
+	// LossMultiplier is applied to LossPct when Reliability >= ReliabilityThreshold.
+	// It penalizes lossy links for reliability-critical packets.
+	LossMultiplier float64
+
+	// ReliabilityThreshold is the minimum Reliability level (inclusive)
+	// at which loss penalty is applied. Default: 2 (guaranteed).
+	ReliabilityThreshold uint8
+
+	// StalePenaltyMultiplier is applied to edge weights when the
+	// originating node is flagged as having stale data. Default: 1.5 (50% penalty).
+	StalePenaltyMultiplier float64
+}
+
+// DefaultWeightConfig returns the standard SPP weight configuration.
+//
+// Weight formula per intent level:
+//
+//	critical (3): weight = latency×2.0 + load×1.5
+//	low      (2): weight = latency×1.5 + load×1.0
+//	normal   (1): weight = latency×1.0 + load×0.5
+//	relaxed  (0): weight = load×0.3
+//
+// If reliability ≥ 2: weight += loss × 10.0
+func DefaultWeightConfig() WeightConfig {
+	return WeightConfig{
+		LatencyMultiplier:      [4]float64{0.0, 1.0, 1.5, 2.0},
+		LoadMultiplier:         [4]float64{0.3, 0.5, 1.0, 1.5},
+		LossMultiplier:         10.0,
+		ReliabilityThreshold:   2,
+		StalePenaltyMultiplier: 1.5,
+	}
+}
+
+// defaultWeightCfg is the package-level default used when callers
+// don't provide an explicit WeightConfig.
+var defaultWeightCfg = DefaultWeightConfig()
+
+// SetDefaultWeightConfig replaces the package-level weight configuration.
+// Call this at program startup to tune routing globally.
+func SetDefaultWeightConfig(cfg WeightConfig) {
+	defaultWeightCfg = cfg
+}
+
+// ──────────────────────────────────────────────────────────────
+// Graph types
+// ──────────────────────────────────────────────────────────────
+
+// Edge represents a weighted directed edge in the routing graph.
+type Edge struct {
+	To     string  // destination node name
+	Weight float64 // composite cost (lower = better)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Graph construction
+// ──────────────────────────────────────────────────────────────
+
+// BuildGraph converts a slice of Links into an adjacency list
+// suitable for Dijkstra. Edge weights are computed using the
+// package-level default WeightConfig.
+func BuildGraph(links []Link, intent IntentHeader) map[string][]Edge {
+	return BuildGraphWithConfig(links, intent, defaultWeightCfg)
+}
+
+// BuildGraphWithConfig converts Links into an adjacency list using
+// the provided WeightConfig. Use this when you need non-default
+// weight tuning (e.g., per-deployment or per-experiment).
+func BuildGraphWithConfig(links []Link, intent IntentHeader, cfg WeightConfig) map[string][]Edge {
+	graph := make(map[string][]Edge, len(links))
+
+	for _, link := range links {
+		weight := calculateWeightWithConfig(link, intent, cfg)
+
+		graph[link.From] = append(graph[link.From], Edge{
+			To:     link.To,
+			Weight: weight,
+		})
+
+		// Ensure destination nodes exist in graph even if they
+		// have no outgoing edges (required for Dijkstra termination).
+		if _, exists := graph[link.To]; !exists {
+			graph[link.To] = []Edge{}
+		}
+	}
+	return graph
+}
+
+// BuildGraphWithPenalties returns a graph where links originating
+// from stale nodes receive an additional weight penalty. This makes
+// Dijkstra prefer paths through nodes with fresher data.
+//
+// staleNodes: set of node names whose outgoing links should be penalized.
+func BuildGraphWithPenalties(links []Link, intent IntentHeader, staleNodes map[string]bool) map[string][]Edge {
+	return BuildGraphWithPenaltiesConfig(links, intent, staleNodes, defaultWeightCfg)
+}
+
+// BuildGraphWithPenaltiesConfig is the configurable variant of
+// BuildGraphWithPenalties, accepting an explicit WeightConfig.
+func BuildGraphWithPenaltiesConfig(links []Link, intent IntentHeader, staleNodes map[string]bool, cfg WeightConfig) map[string][]Edge {
+	graph := make(map[string][]Edge, len(links))
+
+	for _, link := range links {
+		weight := calculateWeightWithConfig(link, intent, cfg)
+
+		// Penalize links from stale nodes.
+		if staleNodes[link.From] {
+			weight *= cfg.StalePenaltyMultiplier
+		}
+
+		graph[link.From] = append(graph[link.From], Edge{
+			To:     link.To,
+			Weight: weight,
+		})
+
+		if _, exists := graph[link.To]; !exists {
+			graph[link.To] = []Edge{}
+		}
+	}
+	return graph
+}
+
+// ──────────────────────────────────────────────────────────────
+// Weight calculation — the core intelligence.
+//
+// The same link gets DIFFERENT weights depending on the packet's
+// intent. This is the fundamental mechanism that makes SPP
+// routing intent-aware.
+// ──────────────────────────────────────────────────────────────
+
+// calculateWeight computes the composite edge weight for a link
+// using the package-level default WeightConfig.
+func calculateWeight(link Link, intent IntentHeader) float64 {
+	return calculateWeightWithConfig(link, intent, defaultWeightCfg)
+}
+
+// calculateWeightWithConfig computes the composite edge weight using
+// an explicit WeightConfig.
+//
+// Weight formula:
+//
+//	weight = latency × latencyMultiplier[intent.Latency]
+//	       + load    × loadMultiplier[intent.Latency]
+//	       + (if reliability ≥ threshold) loss × lossMultiplier
+func calculateWeightWithConfig(link Link, intent IntentHeader, cfg WeightConfig) float64 {
+	// Clamp latency level to valid index range.
+	latLevel := intent.Latency
+	if latLevel > MaxLatency {
+		latLevel = MaxLatency
+	}
+
+	weight := link.LatencyMs*cfg.LatencyMultiplier[latLevel] +
+		link.LoadPct*cfg.LoadMultiplier[latLevel]
+
+	// Add loss penalty for reliability-critical packets.
+	if intent.Reliability >= cfg.ReliabilityThreshold {
+		weight += link.LossPct * cfg.LossMultiplier
+	}
+
+	return weight
+}
+
+// ──────────────────────────────────────────────────────────────
+// Dijkstra implementation.
+//
+// Complexity: O(V²) with linear scan for minimum extraction.
+// This is intentional — SPP mini-maps are small (typically 5–50
+// nodes). A binary-heap version would add code complexity with
+// negligible benefit at this scale. If SPP is deployed on networks
+// with >500 nodes in the mini-map, switch to container/heap.
+// ──────────────────────────────────────────────────────────────
+
+// Dijkstra finds the shortest weighted path from start to end.
+// Returns the path as a slice of node names, or nil if no path exists.
+func Dijkstra(graph map[string][]Edge, start, end string) []string {
+	return dijkstraCore(graph, start, end, nil)
+}
+
+// DijkstraExcluding finds the shortest path while avoiding the
+// specified nodes. Used for rerouting around detected loops.
+// The start and end nodes are never excluded regardless of the set.
+func DijkstraExcluding(graph map[string][]Edge, start, end string, exclude map[string]bool) []string {
+	return dijkstraCore(graph, start, end, exclude)
+}
+
+// dijkstraCore is the shared Dijkstra implementation.
+func dijkstraCore(graph map[string][]Edge, start, end string, exclude map[string]bool) []string {
+	dist := make(map[string]float64, len(graph))
+	prev := make(map[string]string, len(graph))
+	unvisited := make(map[string]bool, len(graph))
+
+	// Initialize all nodes (excluding blacklisted, but never start/end).
+	for node := range graph {
+		if exclude != nil && exclude[node] && node != start && node != end {
+			continue
+		}
+		dist[node] = math.Inf(1)
+		unvisited[node] = true
+	}
+	dist[start] = 0
+
+	for len(unvisited) > 0 {
+		// Extract the unvisited node with the smallest distance.
+		// O(V) scan — acceptable for small mini-maps.
+		current := ""
+		for node := range unvisited {
+			if current == "" || dist[node] < dist[current] {
+				current = node
+			}
+		}
+
+		// Early termination: reached destination or no reachable nodes.
+		if current == end {
+			break
+		}
+		if math.IsInf(dist[current], 1) {
+			break
+		}
+
+		// Relax all outgoing edges.
+		for _, edge := range graph[current] {
+			if exclude != nil && exclude[edge.To] && edge.To != end {
+				continue
+			}
+			newDist := dist[current] + edge.Weight
+			if newDist < dist[edge.To] {
+				dist[edge.To] = newDist
+				prev[edge.To] = current
+			}
+		}
+
+		delete(unvisited, current)
+	}
+
+	// Reconstruct path by walking backward from end to start.
+	path := []string{}
+	current := end
+	for current != "" {
+		path = append([]string{current}, path...)
+		current = prev[current]
+	}
+
+	if len(path) > 0 && path[0] == start {
+		return path
+	}
+	return nil
+}
