@@ -1,7 +1,8 @@
 {
   "Name": "router_b",
-  "ListenAddr": "10.0.2.2:8002",
+  "ListenAddr": "0.0.0.0:8002",
   "GossipPort": 7002,
+  "ProbePort": 6002,
   "ProbeIntervalMs": 100,
   "GossipIntervalMs": 50,
   "Neighbors": {

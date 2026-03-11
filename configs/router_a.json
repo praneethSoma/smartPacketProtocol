@@ -1,13 +1,13 @@
 {
   "Name": "router_a",
-  "ListenAddr": "10.0.1.2:8001",
+  "ListenAddr": "0.0.0.0:8001",
   "GossipPort": 7001,
+  "ProbePort": 6001,
   "ProbeIntervalMs": 100,
   "GossipIntervalMs": 50,
   "Neighbors": {
     "router_b": {"DataAddr": "10.0.2.2:8002", "GossipAddr": "10.0.2.2:7002", "ProbeAddr": "10.0.2.2:6002"},
-    "router_c": {"DataAddr": "10.0.3.2:8003", "GossipAddr": "10.0.3.2:7003", "ProbeAddr": "10.0.3.2:6003"},
-    "sender":   {"DataAddr": "10.0.1.1:8000", "GossipAddr": "10.0.1.1:7000", "ProbeAddr": "10.0.1.1:6000"},
-    "receiver": {"DataAddr": "10.0.5.2:9000", "GossipAddr": "10.0.5.2:7004", "ProbeAddr": "10.0.5.2:6004"}
+    "router_c": {"DataAddr": "10.0.3.2:8003", "GossipAddr": "10.0.3.2:7003", "ProbeAddr": "10.0.3.2:6003"}
   }
 }
+

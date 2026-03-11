@@ -1,7 +1,8 @@
 {
   "Name": "router_c",
-  "ListenAddr": "10.0.3.2:8003",
+  "ListenAddr": "0.0.0.0:8003",
   "GossipPort": 7003,
+  "ProbePort": 6003,
   "ProbeIntervalMs": 100,
   "GossipIntervalMs": 50,
   "Neighbors": {

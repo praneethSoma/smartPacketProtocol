@@ -1,35 +1,91 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"smartpacket/packet"
 )
 
+// ──────────────────────────────────────────────────────────────
+// Configurable defaults
+// ──────────────────────────────────────────────────────────────
+
+const (
+	// DefaultListenAddr is the fallback listen address when none is configured.
+	DefaultListenAddr = "0.0.0.0:9000"
+
+	// UDPMaxPayload is the maximum UDP datagram size.
+	UDPMaxPayload = 65535
+)
+
+// ──────────────────────────────────────────────────────────────
+// Configuration — loaded from JSON.
+// ──────────────────────────────────────────────────────────────
+
+// ReceiverConfig holds receiver configuration.
+type ReceiverConfig struct {
+	ListenAddr string `json:"ListenAddr"` // Address to listen for packets (default: "0.0.0.0:9000")
+}
+
 func main() {
-	listenAddr := "0.0.0.0:9000"
-	if len(os.Args) >= 2 {
-		listenAddr = os.Args[1]
+	logger := slog.Default()
+
+	// Load configuration: JSON file → CLI arg → default.
+	config := ReceiverConfig{
+		ListenAddr: DefaultListenAddr,
 	}
 
-	fmt.Println("═══════════════════════════════════════")
-	fmt.Println("  Smart Packet Protocol — Receiver v1.0")
-	fmt.Println("═══════════════════════════════════════")
-	fmt.Printf("[receiver] Listening on %s\n\n", listenAddr)
+	if len(os.Args) >= 2 {
+		// Try as JSON config file first.
+		data, err := os.ReadFile(os.Args[1])
+		if err == nil {
+			if jsonErr := json.Unmarshal(data, &config); jsonErr != nil {
+				// Not valid JSON — treat as a raw listen address.
+				config.ListenAddr = os.Args[1]
+			}
+		} else {
+			// Can't read file — treat as a raw listen address.
+			config.ListenAddr = os.Args[1]
+		}
+	}
 
-	addr, _ := net.ResolveUDPAddr("udp", listenAddr)
+	logger.Info("═══════════════════════════════════════")
+	logger.Info("Smart Packet Protocol — Receiver v2.0")
+	logger.Info("═══════════════════════════════════════")
+	logger.Info("listening", "addr", config.ListenAddr)
+
+	addr, err := net.ResolveUDPAddr("udp", config.ListenAddr)
+	if err != nil {
+		logger.Error("failed to resolve listen addr", "addr", config.ListenAddr, "err", err)
+		os.Exit(1)
+	}
+
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		fmt.Printf("[receiver] Failed to listen: %v\n", err)
+		logger.Error("failed to listen", "addr", config.ListenAddr, "err", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
-	buf := make([]byte, 65535)
+	// ── Signal handling for graceful shutdown ──
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		logger.Info("received signal — shutting down", "signal", sig)
+		conn.Close()
+		os.Exit(0)
+	}()
+
+	buf := make([]byte, UDPMaxPayload)
 	packetCount := 0
 
 	for {
@@ -43,11 +99,11 @@ func main() {
 
 		p, err := packet.Decode(buf[:n])
 		if err != nil {
-			fmt.Printf("[receiver] Decode error: %v\n", err)
+			logger.Warn("decode error", "err", err)
 			continue
 		}
 
-		// Build status string
+		// Build status string.
 		status := "DELIVERED"
 		statusFlags := []string{}
 		if p.Degraded {
@@ -92,7 +148,7 @@ func main() {
 		}
 
 		fmt.Println("╠══════════════════════════════════════════════════╣")
-		fmt.Printf("║  Packet size: %d bytes                           ║\n", n)
+		fmt.Printf("║  Packet size: %-35s║\n", fmt.Sprintf("%d bytes", n))
 		if p.Rerouted {
 			fmt.Println("║  ⚡ This packet was REROUTED mid-flight         ║")
 		}
@@ -100,5 +156,12 @@ func main() {
 			fmt.Println("║  ⚠ Delivery was DEGRADED (congested path used) ║")
 		}
 		fmt.Println("╚══════════════════════════════════════════════════╝")
+
+		logger.Info("packet delivered",
+			"count", packetCount,
+			"status", status,
+			"from", remoteAddr.String(),
+			"hops", p.HopCount,
+		)
 	}
 }

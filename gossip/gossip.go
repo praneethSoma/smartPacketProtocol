@@ -285,9 +285,16 @@ func (g *GossipNode) receiveLoop() {
 		}
 
 		g.conn.SetReadDeadline(time.Now().Add(readDeadline))
-		n, _, err := g.conn.ReadFromUDP(buf)
+		n, remoteAddr, err := g.conn.ReadFromUDP(buf)
 		if err != nil {
 			continue // Timeout or closed — check stopCh next iteration.
+		}
+
+		// Handle MAP_REQUEST from senders querying for topology.
+		if n == len("MAP_REQUEST") && string(buf[:n]) == "MAP_REQUEST" {
+			log.Info("MAP_REQUEST received", "node", g.config.NodeName, "from", remoteAddr)
+			g.respondToMapRequest(remoteAddr)
+			continue
 		}
 
 		msg, err := decodeGossipMessage(buf[:n])
@@ -305,6 +312,39 @@ func (g *GossipNode) receiveLoop() {
 			)
 		}
 	}
+}
+
+// respondToMapRequest sends a full gossip state message back to the requester.
+func (g *GossipNode) respondToMapRequest(addr *net.UDPAddr) {
+	states := g.state.GetAllStates()
+	if len(states) == 0 {
+		log.Warn("MAP_REQUEST: no topology data to send", "node", g.config.NodeName)
+		return
+	}
+
+	msg := GossipMessage{
+		SenderName: g.config.NodeName,
+		States:     states,
+		SentAt:     time.Now(),
+		IsDelta:    false,
+	}
+
+	data, err := encodeGossipMessage(msg)
+	if err != nil {
+		log.Warn("MAP_REQUEST: encode failed", "err", err)
+		return
+	}
+
+	if _, err := g.conn.WriteToUDP(data, addr); err != nil {
+		log.Warn("MAP_REQUEST: send failed", "addr", addr, "err", err)
+		return
+	}
+
+	log.Info("MAP_REQUEST: responded",
+		"node", g.config.NodeName,
+		"links", len(states),
+		"to", addr,
+	)
 }
 
 // ──────────────────────────────────────────────────────────────

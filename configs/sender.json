@@ -1,8 +1,12 @@
 {
+    "NodeName": "sender",
     "RouterAddr": "10.0.1.2:8001",
     "GossipAddr": "10.0.1.2:7001",
     "Destination": "receiver",
+    "FirstRouter": "router_a",
     "Payload": "player_position:x=100,y=200",
     "IntentLatency": 3,
-    "IntentReliability": 1
+    "IntentReliability": 1,
+    "GossipRetries": 10,
+    "GossipRetryBackoffMs": 500
 }

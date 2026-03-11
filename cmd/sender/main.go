@@ -4,48 +4,70 @@ import (
 	"bytes"
 	"encoding/gob"
 	"encoding/json"
-	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"time"
 
+	"smartpacket/gossip"
 	"smartpacket/packet"
 )
 
-// SenderConfig holds sender configuration
+// ──────────────────────────────────────────────────────────────
+// Configurable defaults
+// ──────────────────────────────────────────────────────────────
+
+const (
+	// DefaultGossipTimeoutMs is how long to wait for a gossip response.
+	DefaultGossipTimeoutMs = 500
+
+	// UDPMaxPayload is the maximum UDP datagram size.
+	UDPMaxPayload = 65535
+)
+
+// ──────────────────────────────────────────────────────────────
+// Configuration — loaded from JSON.
+// ──────────────────────────────────────────────────────────────
+
+// SenderConfig holds sender configuration.
 type SenderConfig struct {
-	RouterAddr        string `json:"RouterAddr"`
-	GossipAddr        string `json:"GossipAddr"`
-	Destination       string `json:"Destination"`
-	Payload           string `json:"Payload"`
-	IntentLatency     uint8  `json:"IntentLatency"`
-	IntentReliability uint8  `json:"IntentReliability"`
+	NodeName             string `json:"NodeName"`             // Source node name (default: "sender")
+	RouterAddr           string `json:"RouterAddr"`
+	GossipAddr           string `json:"GossipAddr"`
+	Destination          string `json:"Destination"`
+	Payload              string `json:"Payload"`
+	FirstRouter          string `json:"FirstRouter"`          // Name of the entry-point router (auto-detect from gossip if empty)
+	IntentLatency        uint8  `json:"IntentLatency"`
+	IntentReliability    uint8  `json:"IntentReliability"`
+	GossipTimeoutMs      int    `json:"GossipTimeoutMs"`      // Timeout for gossip query (default: 500ms)
+	GossipRetries        int    `json:"GossipRetries"`        // Number of gossip query retries (default: 5)
+	GossipRetryBackoffMs int    `json:"GossipRetryBackoffMs"` // Backoff between retries in ms (default: 500)
 }
 
-// GossipMessage mirrors the gossip package structure for decoding
-type GossipMessage struct {
-	SenderName string
-	States     []LinkState
-	SentAt     time.Time
-}
-
-// LinkState mirrors gossip.LinkState
-type LinkState struct {
-	From      string
-	To        string
-	LatencyMs float64
-	LoadPct   float64
-	LossPct   float64
-	Timestamp time.Time
-	Sequence  uint64
+// applyDefaults fills zero-valued fields with production defaults.
+func (c *SenderConfig) applyDefaults() {
+	if c.NodeName == "" {
+		c.NodeName = "sender"
+	}
+	if c.GossipTimeoutMs == 0 {
+		c.GossipTimeoutMs = DefaultGossipTimeoutMs
+	}
+	if c.GossipRetries == 0 {
+		c.GossipRetries = 5
+	}
+	if c.GossipRetryBackoffMs == 0 {
+		c.GossipRetryBackoffMs = 500
+	}
 }
 
 func main() {
-	fmt.Println("═══════════════════════════════════════")
-	fmt.Println("  Smart Packet Protocol — Sender v1.0")
-	fmt.Println("═══════════════════════════════════════")
+	logger := slog.Default()
 
-	// Default config
+	logger.Info("═══════════════════════════════════════")
+	logger.Info("Smart Packet Protocol — Sender v2.0")
+	logger.Info("═══════════════════════════════════════")
+
+	// Default config.
 	config := SenderConfig{
 		RouterAddr:        "10.0.1.2:8001",
 		GossipAddr:        "10.0.1.2:7001",
@@ -55,39 +77,87 @@ func main() {
 		IntentReliability: 1,
 	}
 
-	// Load config from file if provided
+	// Load config from file if provided.
 	if len(os.Args) >= 2 {
 		data, err := os.ReadFile(os.Args[1])
-		if err == nil {
-			json.Unmarshal(data, &config)
+		if err != nil {
+			logger.Error("failed to read config", "path", os.Args[1], "err", err)
+			os.Exit(1)
+		}
+		if err := json.Unmarshal(data, &config); err != nil {
+			logger.Error("failed to parse config", "path", os.Args[1], "err", err)
+			os.Exit(1)
 		}
 	}
+	config.applyDefaults()
 
-	// ── Step 1: Try to get fresh topology from gossip ──
+	logger = slog.With("node", config.NodeName)
+
 	var miniMap []packet.Link
-	fmt.Printf("[sender] Querying gossip from %s...\n", config.GossipAddr)
+	logger.Info("querying gossip", "addr", config.GossipAddr)
 
-	gossipMap := queryGossipState(config.GossipAddr)
-	if len(gossipMap) > 0 {
-		miniMap = gossipMap
-		fmt.Printf("[sender] Got live topology: %d links\n", len(miniMap))
-		for _, l := range miniMap {
-			fmt.Printf("[sender]   %s → %s  lat=%.1fms load=%.0f%% loss=%.0f%%\n",
-				l.From, l.To, l.LatencyMs, l.LoadPct, l.LossPct)
+	gossipTimeout := time.Duration(config.GossipTimeoutMs) * time.Millisecond
+	backoff := time.Duration(config.GossipRetryBackoffMs) * time.Millisecond
+
+	for attempt := 1; attempt <= config.GossipRetries; attempt++ {
+		gossipMap := queryGossipState(config.GossipAddr, gossipTimeout)
+		if len(gossipMap) > 0 {
+			miniMap = gossipMap
+			logger.Info("got live topology", "links", len(miniMap), "attempt", attempt)
+			for _, l := range miniMap {
+				logger.Info("  link",
+					"from", l.From, "to", l.To,
+					"lat_ms", l.LatencyMs, "load", l.LoadPct, "loss", l.LossPct,
+				)
+			}
+			break
 		}
-	} else {
-		// Fallback: hardcoded map (backward compatibility)
-		fmt.Println("[sender] No gossip data — using fallback map")
-		miniMap = []packet.Link{
-			{From: "sender", To: "router_a", LatencyMs: 1, LoadPct: 5, LossPct: 0},
-			{From: "router_a", To: "router_b", LatencyMs: 5, LoadPct: 90, LossPct: 8},
-			{From: "router_a", To: "router_c", LatencyMs: 5, LoadPct: 10, LossPct: 0},
-			{From: "router_b", To: "receiver", LatencyMs: 100, LoadPct: 90, LossPct: 8},
-			{From: "router_c", To: "receiver", LatencyMs: 5, LoadPct: 10, LossPct: 0},
+		logger.Warn("gossip attempt failed",
+			"attempt", attempt,
+			"max", config.GossipRetries,
+			"retry_in", backoff,
+		)
+		if attempt < config.GossipRetries {
+			time.Sleep(backoff)
 		}
 	}
 
-	// ── Step 2: Build the smart packet ──
+	if len(miniMap) == 0 {
+		logger.Error("gossip unavailable after all retries — cannot send",
+			"retries", config.GossipRetries,
+			"addr", config.GossipAddr,
+		)
+		os.Exit(1)
+	}
+
+	// ── Step 2: Inject sender→first-router link ──
+	// Gossip only has router-to-router links. The sender needs to add
+	// its own edge so Dijkstra can find a path from sender → destination.
+	firstRouter := config.FirstRouter
+	if firstRouter == "" {
+		// Auto-detect: pick the router name that appears most as a From node.
+		nameCount := make(map[string]int)
+		for _, l := range miniMap {
+			nameCount[l.From]++
+		}
+		bestCount := 0
+		for name, count := range nameCount {
+			if count > bestCount {
+				bestCount = count
+				firstRouter = name
+			}
+		}
+		logger.Info("auto-detected first router", "name", firstRouter)
+	}
+
+	if firstRouter != "" {
+		miniMap = append(miniMap, packet.Link{
+			From: config.NodeName, To: firstRouter,
+			LatencyMs: 0.1, LoadPct: 0, LossPct: 0,
+		})
+	}
+
+	// ── Step 3: Build the smart packet ──
 	intent := packet.IntentHeader{
 		Reliability: config.IntentReliability,
 		Latency:     config.IntentLatency,
@@ -97,41 +167,63 @@ func main() {
 
 	p := packet.NewSmartPacket(config.Destination, intent, miniMap, []byte(config.Payload))
 
-	// ── Step 3: Packet calculates its own path ──
+	// ── Step 4: Packet calculates its own path ──
 	graph := packet.BuildGraph(miniMap, intent)
-	path := packet.Dijkstra(graph, "sender", config.Destination)
+	path := packet.Dijkstra(graph, config.NodeName, config.Destination)
+	if len(path) == 0 {
+		logger.Error("no path found to destination",
+			"from", config.NodeName,
+			"to", config.Destination,
+			"links", len(miniMap),
+		)
+		os.Exit(1)
+	}
 	p.UpdatePath(path)
 
-	fmt.Printf("\n[sender] ── Smart Packet Created ──────\n")
-	fmt.Printf("[sender] Destination: %s\n", config.Destination)
-	fmt.Printf("[sender] Intent:      latency=%d reliability=%d\n", intent.Latency, intent.Reliability)
-	fmt.Printf("[sender] Chosen path: %v\n", path)
-	fmt.Printf("[sender] MaxHops:     %d\n", p.MaxHops)
-	fmt.Printf("[sender] Payload:     %s\n", string(p.Payload))
+	logger.Info("smart packet created",
+		"dest", config.Destination,
+		"intent", intent.String(),
+		"path", path,
+		"max_hops", p.MaxHops,
+		"payload_len", len(p.Payload),
+	)
 
 	// ── Step 4: Transmit over UDP ──
 	encoded, err := p.Encode()
 	if err != nil {
-		fmt.Printf("[sender] Encode error: %v\n", err)
+		logger.Error("encode failed", "err", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("[sender] Packet size: %d bytes\n", len(encoded))
+	logger.Info("packet encoded", "bytes", len(encoded))
 
-	addr, _ := net.ResolveUDPAddr("udp", config.RouterAddr)
+	addr, err := net.ResolveUDPAddr("udp", config.RouterAddr)
+	if err != nil {
+		logger.Error("failed to resolve router addr", "addr", config.RouterAddr, "err", err)
+		os.Exit(1)
+	}
+
 	conn, err := net.DialUDP("udp", nil, addr)
 	if err != nil {
-		fmt.Printf("[sender] Dial error: %v\n", err)
+		logger.Error("dial failed", "addr", config.RouterAddr, "err", err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
-	conn.Write(encoded)
-	fmt.Printf("[sender] Packet sent at %s to %s\n", time.Now().Format("15:04:05.000"), config.RouterAddr)
+	if _, err := conn.Write(encoded); err != nil {
+		logger.Error("write failed", "err", err)
+		os.Exit(1)
+	}
+
+	logger.Info("packet sent",
+		"time", time.Now().Format("15:04:05.000"),
+		"target", config.RouterAddr,
+	)
 }
 
-// queryGossipState listens for a gossip broadcast to get live topology
-func queryGossipState(gossipAddr string) []packet.Link {
+// queryGossipState listens for a gossip broadcast to get live topology.
+// Uses gossip.GossipMessage and gossip.LinkState directly to avoid struct duplication.
+func queryGossipState(gossipAddr string, timeout time.Duration) []packet.Link {
 	listenAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:0")
 	if err != nil {
 		return nil
@@ -143,20 +235,25 @@ func queryGossipState(gossipAddr string) []packet.Link {
 	}
 	defer conn.Close()
 
-	// Nudge the gossip address
-	targetAddr, _ := net.ResolveUDPAddr("udp", gossipAddr)
-	conn.WriteToUDP([]byte("MAP_REQUEST"), targetAddr)
+	// Nudge the gossip address to trigger a response.
+	targetAddr, err := net.ResolveUDPAddr("udp", gossipAddr)
+	if err != nil {
+		return nil
+	}
+	if _, err := conn.WriteToUDP([]byte("MAP_REQUEST"), targetAddr); err != nil {
+		return nil
+	}
 
-	// Wait for response
-	conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	buf := make([]byte, 65535)
+	// Wait for response with configurable timeout.
+	conn.SetReadDeadline(time.Now().Add(timeout))
+	buf := make([]byte, UDPMaxPayload)
 	n, _, err := conn.ReadFromUDP(buf)
 	if err != nil {
 		return nil
 	}
 
-	// Decode gossip message
-	var msg GossipMessage
+	// Decode gossip message using the gossip package types.
+	var msg gossip.GossipMessage
 	dec := gob.NewDecoder(bytes.NewBuffer(buf[:n]))
 	if err := dec.Decode(&msg); err != nil {
 		return nil
