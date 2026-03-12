@@ -13,6 +13,9 @@ RUN go build -o bin/router  ./cmd/router  && \
 # ── Stage 2: Runtime ────────────────────────────────────────
 FROM alpine:3.19
 
+# Install iproute2 for tc (traffic control) — needed for netem delay injection
+RUN apk add --no-cache iproute2
+
 WORKDIR /app
 COPY --from=builder /app/bin/    ./bin/
 COPY --from=builder /app/configs/ ./configs/

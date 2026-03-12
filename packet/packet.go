@@ -190,6 +190,9 @@ type SmartPacket struct {
 	// Congestion audit trail — live data written by routers
 	CongestionLog []HopRecord
 
+	// Timing — set by the sender for end-to-end latency measurement
+	CreatedAtNs int64 // Unix nanosecond timestamp when the packet was created
+
 	// Application payload
 	Payload []byte
 }

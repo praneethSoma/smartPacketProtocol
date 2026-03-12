@@ -58,7 +58,7 @@ func main() {
 	}
 
 	logger.Info("═══════════════════════════════════════")
-	logger.Info("Smart Packet Protocol — Receiver v2.0")
+	logger.Info("Smart Packet Protocol — Receiver v2.1")
 	logger.Info("═══════════════════════════════════════")
 	logger.Info("listening", "addr", config.ListenAddr)
 
@@ -88,6 +88,11 @@ func main() {
 	buf := make([]byte, UDPMaxPayload)
 	packetCount := 0
 
+	// Latency stats for burst mode
+	var totalLatencyMs float64
+	var minLatencyMs float64 = 999999
+	var maxLatencyMs float64
+
 	for {
 		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
@@ -101,6 +106,20 @@ func main() {
 		if err != nil {
 			logger.Warn("decode error", "err", err)
 			continue
+		}
+
+		// Compute end-to-end latency if timestamp is present.
+		var e2eLatencyMs float64
+		hasTimestamp := p.CreatedAtNs > 0
+		if hasTimestamp {
+			e2eLatencyMs = float64(receivedAt.UnixNano()-p.CreatedAtNs) / 1e6
+			totalLatencyMs += e2eLatencyMs
+			if e2eLatencyMs < minLatencyMs {
+				minLatencyMs = e2eLatencyMs
+			}
+			if e2eLatencyMs > maxLatencyMs {
+				maxLatencyMs = e2eLatencyMs
+			}
 		}
 
 		// Build status string.
@@ -123,7 +142,7 @@ func main() {
 		fmt.Printf("║  Packet #:    %-35d║\n", packetCount)
 		fmt.Printf("║  Status:      %-35s║\n", status)
 		fmt.Printf("║  From:        %-35s║\n", remoteAddr.String())
-		fmt.Printf("║  Received at: %-35s║\n", receivedAt.Format("15:04:05.000"))
+		fmt.Printf("║  Received at: %-35s║\n", receivedAt.Format("15:04:05.000000"))
 		fmt.Println("╠══════════════════════════════════════════════════╣")
 		fmt.Printf("║  Payload:     %-35s║\n", string(p.Payload))
 		fmt.Printf("║  Destination: %-35s║\n", p.Destination)
@@ -131,6 +150,17 @@ func main() {
 		fmt.Printf("║  Total hops:  %-35d║\n", p.HopCount)
 		fmt.Printf("║  Max hops:    %-35d║\n", p.MaxHops)
 		fmt.Println("╠══════════════════════════════════════════════════╣")
+
+		// Latency section
+		if hasTimestamp {
+			fmt.Println("║  LATENCY                                        ║")
+			fmt.Printf("║    End-to-end: %8.3f ms                       ║\n", e2eLatencyMs)
+			avgMs := totalLatencyMs / float64(packetCount)
+			fmt.Printf("║    Avg (all):  %8.3f ms                       ║\n", avgMs)
+			fmt.Printf("║    Min:        %8.3f ms  Max: %8.3f ms     ║\n", minLatencyMs, maxLatencyMs)
+			fmt.Println("╠══════════════════════════════════════════════════╣")
+		}
+
 		fmt.Println("║  INTENT                                         ║")
 		fmt.Printf("║    Latency:     %d (0=relaxed 3=critical)       ║\n", p.Intent.Latency)
 		fmt.Printf("║    Reliability: %d (0=none 2=guaranteed)        ║\n", p.Intent.Reliability)
@@ -162,6 +192,7 @@ func main() {
 			"status", status,
 			"from", remoteAddr.String(),
 			"hops", p.HopCount,
+			"e2e_latency_ms", fmt.Sprintf("%.3f", e2eLatencyMs),
 		)
 	}
 }

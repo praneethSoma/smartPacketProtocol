@@ -1,0 +1,12 @@
+{
+  "Name": "router_e",
+  "ListenAddr": "0.0.0.0:8005",
+  "GossipPort": 7005,
+  "ProbePort": 6005,
+  "ProbeIntervalMs": 100,
+  "GossipIntervalMs": 50,
+  "Neighbors": {
+    "router_c": {"DataAddr": "10.1.6.1:8003", "GossipAddr": "10.1.6.1:7003", "ProbeAddr": "10.1.6.1:6003"},
+    "router_g": {"DataAddr": "10.1.8.2:8007", "GossipAddr": "10.1.8.2:7007", "ProbeAddr": "10.1.8.2:6007"}
+  }
+}
