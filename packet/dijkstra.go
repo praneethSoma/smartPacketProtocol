@@ -26,12 +26,18 @@ type WeightConfig struct {
 	// Higher values make Dijkstra penalize high-load links more.
 	LoadMultiplier [4]float64
 
-	// LossMultiplier is applied to LossPct when Reliability >= ReliabilityThreshold.
-	// It penalizes lossy links for reliability-critical packets.
+	// LossMultiplier is applied to LossPct for reliability-critical packets.
+	// For lower reliability levels, a base loss penalty is always applied
+	// to avoid routing through completely broken links.
 	LossMultiplier float64
 
+	// BaseLossMultiplier is the minimum loss penalty applied regardless
+	// of reliability level. Ensures links with high loss (e.g., 100%)
+	// are always penalized. Default: 2.0.
+	BaseLossMultiplier float64
+
 	// ReliabilityThreshold is the minimum Reliability level (inclusive)
-	// at which loss penalty is applied. Default: 2 (guaranteed).
+	// at which the full LossMultiplier is applied. Default: 2 (guaranteed).
 	ReliabilityThreshold uint8
 
 	// StalePenaltyMultiplier is applied to edge weights when the
@@ -54,6 +60,7 @@ func DefaultWeightConfig() WeightConfig {
 		LatencyMultiplier:      [4]float64{0.0, 1.0, 1.5, 2.0},
 		LoadMultiplier:         [4]float64{0.3, 0.5, 1.0, 1.5},
 		LossMultiplier:         10.0,
+		BaseLossMultiplier:     2.0,
 		ReliabilityThreshold:   2,
 		StalePenaltyMultiplier: 1.5,
 	}
@@ -179,9 +186,12 @@ func calculateWeightWithConfig(link Link, intent IntentHeader, cfg WeightConfig)
 	weight := link.LatencyMs*cfg.LatencyMultiplier[latLevel] +
 		link.LoadPct*cfg.LoadMultiplier[latLevel]
 
-	// Add loss penalty for reliability-critical packets.
+	// Always apply a base loss penalty so Dijkstra avoids broken links
+	// (e.g., 100% loss). Higher reliability levels get a stronger penalty.
 	if intent.Reliability >= cfg.ReliabilityThreshold {
 		weight += link.LossPct * cfg.LossMultiplier
+	} else if cfg.BaseLossMultiplier > 0 {
+		weight += link.LossPct * cfg.BaseLossMultiplier
 	}
 
 	return weight

@@ -9,6 +9,11 @@
   "IntentReliability": 1,
   "GossipRetries": 10,
   "GossipRetryBackoffMs": 500,
+  "LightMode": true,
   "PacketCount": 1,
-  "IntervalMs": 0
+  "IntervalMs": 0,
+  "NodeIDMap": {
+    "sender": 1, "router_a": 2, "router_b": 3, "router_c": 4,
+    "router_d": 5, "router_e": 6, "router_f": 7, "router_g": 8, "receiver": 9
+  }
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"encoding/json"
 	"log/slog"
@@ -44,7 +45,10 @@ type SenderConfig struct {
 	GossipRetryBackoffMs int      `json:"GossipRetryBackoffMs"` // Backoff between retries in ms (default: 500)
 	PacketCount          int      `json:"PacketCount"`          // Number of packets to send (default: 1)
 	IntervalMs           int      `json:"IntervalMs"`           // Delay between packets in ms (default: 0)
-	StaticPath           []string `json:"StaticPath"`           // If set, skip gossip and use this exact path (baseline mode)
+	StaticPath           []string          `json:"StaticPath"`           // If set, skip gossip and use this exact path (baseline mode)
+	RawMode              bool              `json:"RawMode"`              // If true, send raw 8-byte timestamp (no SPP framing) for overhead measurement
+	LightMode            bool              `json:"LightMode"`            // If true, don't embed MiniMap — routers use local gossip for rerouting
+	NodeIDMap            map[string]uint16 `json:"NodeIDMap"`            // Compact node ID mapping for wire compression
 }
 
 // applyDefaults fills zero-valued fields with production defaults.
@@ -110,7 +114,10 @@ func main() {
 	var miniMap []packet.Link
 	var path []string
 
-	if len(config.StaticPath) > 0 {
+	if config.RawMode {
+		// ── Raw probe mode: skip all SPP path computation ──
+		logger.Info("raw probe mode — SPP skipped, will send 8-byte timestamps")
+	} else if len(config.StaticPath) > 0 {
 		// ── Static baseline mode: skip gossip, use hardcoded path ──
 		// Empty MiniMap ensures routers will NOT reroute this packet,
 		// so it always follows the fixed path regardless of congestion.
@@ -208,14 +215,44 @@ func main() {
 	// ── Step 6: Send packet(s) ──
 	interval := time.Duration(config.IntervalMs) * time.Millisecond
 
-	for i := 0; i < config.PacketCount; i++ {
-		p := packet.NewSmartPacket(config.Destination, intent, miniMap, []byte(config.Payload))
-		p.CreatedAtNs = time.Now().UnixNano()
-		p.UpdatePath(path)
+	var nodeIDTable *packet.NodeIDTable
+	if len(config.NodeIDMap) > 0 {
+		nodeIDTable = packet.NewNodeIDTable(config.NodeIDMap)
+	}
 
-		encoded, err := p.Encode()
-		if err != nil {
-			logger.Error("encode failed", "err", err, "packet", i+1)
+	for i := 0; i < config.PacketCount; i++ {
+		if config.RawMode {
+			var buf [8]byte
+			binary.BigEndian.PutUint64(buf[:], uint64(time.Now().UnixNano()))
+			if _, err := conn.Write(buf[:]); err != nil {
+				logger.Error("raw probe write failed", "err", err)
+				os.Exit(1)
+			}
+			logger.Info("raw probe sent", "packet", i+1, "of", config.PacketCount)
+			if i < config.PacketCount-1 && interval > 0 {
+				time.Sleep(interval)
+			}
+			continue
+		}
+
+		var p *packet.SmartPacket
+		if config.LightMode {
+			p = packet.NewLightPacket(config.Destination, intent, path, []byte(config.Payload))
+		} else {
+			p = packet.NewSmartPacket(config.Destination, intent, miniMap, []byte(config.Payload))
+			p.UpdatePath(path)
+		}
+		p.CreatedAtNs = time.Now().UnixNano()
+
+		var encoded []byte
+		var encErr error
+		if nodeIDTable != nil {
+			encoded, encErr = p.EncodeWireWithIDs(nodeIDTable)
+		} else {
+			encoded, encErr = p.EncodeWire()
+		}
+		if encErr != nil {
+			logger.Error("encode failed", "err", encErr, "packet", i+1)
 			os.Exit(1)
 		}
 

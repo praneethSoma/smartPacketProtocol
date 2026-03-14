@@ -9,5 +9,9 @@
     "router_d": {"DataAddr": "10.1.7.1:8004", "GossipAddr": "10.1.7.1:7004", "ProbeAddr": "10.1.7.1:6004"},
     "router_e": {"DataAddr": "10.1.8.1:8005", "GossipAddr": "10.1.8.1:7005", "ProbeAddr": "10.1.8.1:6005"},
     "receiver": {"DataAddr": "10.1.9.2:9000", "GossipAddr": "10.1.9.2:7010", "ProbeAddr": "10.1.9.2:6010"}
+  },
+  "NodeIDMap": {
+    "sender": 1, "router_a": 2, "router_b": 3, "router_c": 4,
+    "router_d": 5, "router_e": 6, "router_f": 7, "router_g": 8, "receiver": 9
   }
 }

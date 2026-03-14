@@ -27,6 +27,8 @@ services:
         ipv4_address: 10.1.9.2
       net_fr:
         ipv4_address: 10.1.10.2
+      net_sr:
+        ipv4_address: 10.1.11.2
     restart: unless-stopped
 
   # ── Router A (hub — connects to sender, B, C, F) ────────────
@@ -199,6 +201,8 @@ services:
     networks:
       net_sa:
         ipv4_address: 10.1.1.1
+      net_sr:
+        ipv4_address: 10.1.11.1
     depends_on:
       - router_a
       - router_b
@@ -280,3 +284,11 @@ networks:
       config:
         - subnet: 10.1.10.0/24
           gateway: 10.1.10.254
+
+  # Direct sender↔receiver link — used only for overhead measurement (no routers)
+  net_sr:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.1.11.0/24
+          gateway: 10.1.11.254

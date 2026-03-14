@@ -77,7 +77,7 @@ func (r *miniRouter) start(t *testing.T) {
 				continue
 			}
 
-			p, err := packet.Decode(buf[:n])
+			p, err := packet.DecodeWire(buf[:n])
 			if err != nil {
 				continue
 			}
@@ -117,7 +117,7 @@ func (r *miniRouter) start(t *testing.T) {
 				continue
 			}
 
-			encoded, err := p.Encode()
+			encoded, err := p.EncodeWire()
 			if err != nil {
 				continue
 			}
@@ -191,7 +191,7 @@ func TestEndToEndDelivery(t *testing.T) {
 	p.UpdatePath(path)
 	p.SourceNode = "sender"
 
-	encoded, err := p.Encode()
+	encoded, err := p.EncodeWire()
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestEndToEndDelivery(t *testing.T) {
 		t.Fatalf("Receiver did not get packet: %v", err)
 	}
 
-	received, err := packet.Decode(buf[:n])
+	received, err := packet.DecodeWire(buf[:n])
 	if err != nil {
 		t.Fatalf("decode at receiver: %v", err)
 	}
@@ -279,7 +279,7 @@ func TestRerouteOnHighLoad(t *testing.T) {
 	// Force initial path through B.
 	p.UpdatePath([]string{"sender", "router_a", "router_b", "receiver"})
 
-	encoded, _ := p.Encode()
+	encoded, _ := p.EncodeWire()
 	udpAddr, _ := net.ResolveUDPAddr("udp", routerA.listenAddr)
 	sendConn, _ := net.DialUDP("udp", nil, udpAddr)
 	sendConn.Write(encoded)
@@ -293,7 +293,7 @@ func TestRerouteOnHighLoad(t *testing.T) {
 		t.Fatalf("Receiver did not get packet: %v", err)
 	}
 
-	received, _ := packet.Decode(buf[:n])
+	received, _ := packet.DecodeWire(buf[:n])
 	if string(received.Payload) != "reroute_test" {
 		t.Fatalf("Payload mismatch: got %q", received.Payload)
 	}
@@ -350,7 +350,7 @@ func TestLoopDetection(t *testing.T) {
 	// Deliberately create a looping path.
 	p.UpdatePath([]string{"router_a", "router_b", "router_c", "router_a"})
 
-	encoded, _ := p.Encode()
+	encoded, _ := p.EncodeWire()
 	udpAddr, _ := net.ResolveUDPAddr("udp", routerA.listenAddr)
 	sendConn, _ := net.DialUDP("udp", nil, udpAddr)
 	sendConn.Write(encoded)
@@ -369,7 +369,7 @@ func TestLoopDetection(t *testing.T) {
 		return
 	}
 
-	received, _ := packet.Decode(buf[:n])
+	received, _ := packet.DecodeWire(buf[:n])
 	if received.Degraded {
 		t.Logf("✅ Loop detected and escaped: degraded=%v, hops=%d, payload=%q",
 			received.Degraded, received.HopCount, received.Payload)

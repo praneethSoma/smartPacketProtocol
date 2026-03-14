@@ -24,15 +24,18 @@ const (
 	DefaultGossipIntervalMs = 50
 
 	// DefaultStableIntervalMs is the slow broadcast interval
-	// used when the network topology is stable.
-	DefaultStableIntervalMs = 500
+	// used when the network topology is stable. Must be low enough
+	// that multi-hop propagation completes within MaxStalenessMs.
+	DefaultStableIntervalMs = 200
 
 	// DefaultFullSyncIntervalMs is the interval for full-state
 	// broadcasts as a safety net against topology drift.
-	DefaultFullSyncIntervalMs = 5000
+	DefaultFullSyncIntervalMs = 2000
 
 	// DefaultMaxStalenessMs is the age after which a link is pruned.
-	DefaultMaxStalenessMs = 1000
+	// Must be large enough for multi-hop gossip propagation:
+	// e.g., 3 hops × 200ms stable interval = 600ms, so 5000ms gives ample margin.
+	DefaultMaxStalenessMs = 5000
 
 	// DefaultWarnStalenessMs is the age at which a link is flagged
 	// as unreliable and receives a penalty in routing.

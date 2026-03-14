@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -32,7 +33,8 @@ const (
 
 // ReceiverConfig holds receiver configuration.
 type ReceiverConfig struct {
-	ListenAddr string `json:"ListenAddr"` // Address to listen for packets (default: "0.0.0.0:9000")
+	ListenAddr string            `json:"ListenAddr"` // Address to listen for packets (default: "0.0.0.0:9000")
+	NodeIDMap  map[string]uint16 `json:"NodeIDMap"`   // Compact node ID mapping for wire compression
 }
 
 func main() {
@@ -85,6 +87,11 @@ func main() {
 		os.Exit(0)
 	}()
 
+	var nodeIDTable *packet.NodeIDTable
+	if len(config.NodeIDMap) > 0 {
+		nodeIDTable = packet.NewNodeIDTable(config.NodeIDMap)
+	}
+
 	buf := make([]byte, UDPMaxPayload)
 	packetCount := 0
 
@@ -102,7 +109,18 @@ func main() {
 		receivedAt := time.Now()
 		packetCount++
 
-		p, err := packet.Decode(buf[:n])
+		// Raw timing probe: exactly 8 bytes = big-endian int64 UnixNano.
+		// Used by the overhead test to measure baseline Docker network latency
+		// with zero SPP framing or router processing.
+		if n == 8 {
+			sentNs := int64(binary.BigEndian.Uint64(buf[:8]))
+			latencyMs := float64(receivedAt.UnixNano()-sentNs) / 1e6
+			fmt.Printf("║  RAW PROBE latency: %8.3f ms               ║\n", latencyMs)
+			logger.Info("raw probe", "latency_ms", fmt.Sprintf("%.3f", latencyMs))
+			continue
+		}
+
+		p, err := packet.DecodeWireWithIDs(buf[:n], nodeIDTable)
 		if err != nil {
 			logger.Warn("decode error", "err", err)
 			continue

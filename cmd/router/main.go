@@ -33,14 +33,14 @@ const (
 	DefaultGossipPort = 7000
 
 	// DefaultMaxStalenessMs is the fallback max link age before pruning.
-	DefaultMaxStalenessMs = 1000
+	DefaultMaxStalenessMs = 5000
 
 	// DefaultWarnStalenessMs is the fallback age at which links are penalized.
-	DefaultWarnStalenessMs = 300
+	DefaultWarnStalenessMs = 2000
 
 	// DefaultFreshnessMs is the fallback freshness threshold for
 	// GetFreshLinks() when deciding whether gossip data is usable.
-	DefaultFreshnessMs = 500
+	DefaultFreshnessMs = 3000
 
 	// DefaultMetricsPort is the fallback HTTP port for /metrics,
 	// /healthz, and /readyz endpoints.
@@ -74,6 +74,7 @@ type NodeConfig struct {
 	FreshnessMs      int                       `json:"FreshnessMs"`
 	MetricsPort      int                       `json:"MetricsPort"`      // HTTP port for /metrics, /healthz, /readyz
 	Neighbors        map[string]NeighborConfig `json:"Neighbors"`
+	NodeIDMap        map[string]uint16         `json:"NodeIDMap"`        // Compact node ID mapping for wire compression
 }
 
 // applyDefaults fills zero-valued fields with production defaults.
@@ -255,6 +256,11 @@ func main() {
 	}
 	defer conn.Close()
 
+	var nodeIDTable *packet.NodeIDTable
+	if len(config.NodeIDMap) > 0 {
+		nodeIDTable = packet.NewNodeIDTable(config.NodeIDMap)
+	}
+
 	pool := connpool.New()
 	defer pool.Close()
 	buf := make([]byte, UDPMaxPayload)
@@ -265,7 +271,7 @@ func main() {
 			continue
 		}
 
-		p, err := packet.Decode(buf[:n])
+		p, err := packet.DecodeWireWithIDs(buf[:n], nodeIDTable)
 		if err != nil {
 			logger.Warn("decode error", "err", err)
 			continue
@@ -303,7 +309,16 @@ func main() {
 		logger.Info("stamped", "load", currentLoad, "latency_ms", currentLatency)
 
 		// ── Step 3: Check for reroute ──
-		if p.ShouldReroute(config.Name, currentLoad, currentLatency, packet.RerouteThreshold) {
+		if p.LightMode {
+			// LightMode: packet has no MiniMap — use router's local gossip topology
+			freshLinks := topoState.GetFreshLinks(freshnessThreshold)
+			if len(freshLinks) > 0 && p.ShouldRerouteFromTopology(config.Name, currentLoad, currentLatency, packet.RerouteThreshold, freshLinks) {
+				logger.Info("conditions diverged — rerouting (light mode)")
+				p.RerouteFromTopology(config.Name, freshLinks)
+				logger.Info("rerouted", "new_path", p.PlannedPath)
+				prom.IncReroutes()
+			}
+		} else if p.ShouldReroute(config.Name, currentLoad, currentLatency, packet.RerouteThreshold) {
 			logger.Info("conditions diverged — rerouting")
 
 			freshLinks := topoState.GetFreshLinks(freshnessThreshold)
@@ -323,7 +338,12 @@ func main() {
 		if nextHop != "" && p.DetectLoop(nextHop) {
 			logger.Warn("loop detected — force-forwarding", "loop_node", nextHop)
 			prom.IncLoops()
-			nextHop = p.ForceForward(config.Name)
+			if p.LightMode {
+				freshLinks := topoState.GetFreshLinks(freshnessThreshold)
+				nextHop = p.ForceForwardFromTopology(config.Name, freshLinks)
+			} else {
+				nextHop = p.ForceForward(config.Name)
+			}
 			p.Degraded = true
 			logger.Info("force-forward", "next", nextHop)
 		}
@@ -340,7 +360,12 @@ func main() {
 			continue
 		}
 
-		encoded, err := p.Encode()
+		var encoded []byte
+		if nodeIDTable != nil {
+			encoded, err = p.EncodeWireWithIDs(nodeIDTable)
+		} else {
+			encoded, err = p.EncodeWire()
+		}
 		if err != nil {
 			logger.Warn("encode error", "err", err)
 			prom.IncDropped("encode_error")

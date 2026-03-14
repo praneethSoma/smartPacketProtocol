@@ -8,5 +8,9 @@
   "Neighbors": {
     "router_a": {"DataAddr": "10.1.4.1:8001", "GossipAddr": "10.1.4.1:7001", "ProbeAddr": "10.1.4.1:6001"},
     "receiver": {"DataAddr": "10.1.10.2:9000", "GossipAddr": "10.1.10.2:7010", "ProbeAddr": "10.1.10.2:6010"}
+  },
+  "NodeIDMap": {
+    "sender": 1, "router_a": 2, "router_b": 3, "router_c": 4,
+    "router_d": 5, "router_e": 6, "router_f": 7, "router_g": 8, "receiver": 9
   }
 }

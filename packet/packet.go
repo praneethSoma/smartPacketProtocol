@@ -30,6 +30,17 @@ const (
 	// exceeds this value, a reroute is triggered without percentage math.
 	DefaultSignificantLatencyMs = 10.0
 
+	// DefaultMinDivergenceLoad is the minimum absolute load difference
+	// (in percentage points) required to trigger a reroute. Prevents
+	// spurious reroutes when both actual and expected values are small
+	// (e.g., 0.8% vs 2.9% — 72% relative divergence but only 2.1 pp
+	// absolute difference, which is insignificant).
+	DefaultMinDivergenceLoad = 10.0
+
+	// DefaultMinDivergenceLatencyMs is the minimum absolute latency
+	// difference (in ms) required to trigger a reroute.
+	DefaultMinDivergenceLatencyMs = 5.0
+
 	// MaxReliability is the upper bound for IntentHeader.Reliability.
 	MaxReliability uint8 = 2
 	// MaxLatency is the upper bound for IntentHeader.Latency.
@@ -185,6 +196,7 @@ type SmartPacket struct {
 	// Routing flags
 	Degraded     bool            // True if forced to take a suboptimal path
 	Rerouted     bool            // True if path was recalculated mid-flight
+	LightMode    bool            // True if packet carries no MiniMap (routers use local gossip)
 	VisitedNodes map[string]bool // Loop detection — tracks every node visited
 
 	// Congestion audit trail — live data written by routers
@@ -284,8 +296,8 @@ func (p *SmartPacket) ShouldReroute(currentNode string, currentLoad, currentLate
 			continue
 		}
 
-		// Check load divergence
-		if diverges(currentLoad, link.LoadPct, threshold) {
+		// Check load divergence (with absolute floor to avoid spurious triggers)
+		if divergesWithFloor(currentLoad, link.LoadPct, threshold, DefaultMinDivergenceLoad) {
 			log.Info("load divergence detected",
 				"node", currentNode,
 				"map_load", link.LoadPct,
@@ -294,8 +306,8 @@ func (p *SmartPacket) ShouldReroute(currentNode string, currentLoad, currentLate
 			return true
 		}
 
-		// Check latency divergence
-		if diverges(currentLatency, link.LatencyMs, threshold) {
+		// Check latency divergence (with absolute floor)
+		if divergesWithFloor(currentLatency, link.LatencyMs, threshold, DefaultMinDivergenceLatencyMs) {
 			log.Info("latency divergence detected",
 				"node", currentNode,
 				"map_latency_ms", link.LatencyMs,
@@ -308,11 +320,25 @@ func (p *SmartPacket) ShouldReroute(currentNode string, currentLoad, currentLate
 }
 
 // diverges returns true if actual diverges from expected by more than
-// thresholdPct. When expected is zero, we use DefaultSignificantLatencyMs
-// as an absolute threshold to avoid division by zero.
+// thresholdPct AND the absolute difference exceeds minAbsolute.
+// The dual threshold prevents spurious reroutes when both values are
+// small (e.g., 0.8% vs 2.9% load — 72% relative but only 2.1 pp absolute).
+// When expected is zero, we use DefaultSignificantLatencyMs as an absolute
+// threshold to avoid division by zero.
 func diverges(actual, expected, thresholdPct float64) bool {
+	return divergesWithFloor(actual, expected, thresholdPct, 0)
+}
+
+// divergesWithFloor is like diverges but with an explicit minimum absolute
+// difference floor. If the absolute difference is below minAbsolute, no
+// divergence is reported regardless of percentage.
+func divergesWithFloor(actual, expected, thresholdPct, minAbsolute float64) bool {
+	absDiff := math.Abs(actual - expected)
+	if minAbsolute > 0 && absDiff < minAbsolute {
+		return false
+	}
 	if expected > 0 {
-		pct := (math.Abs(actual-expected) / expected) * 100
+		pct := (absDiff / expected) * 100
 		return pct > thresholdPct
 	}
 	// Map says 0 — use absolute significance threshold.
@@ -463,4 +489,124 @@ func (p *SmartPacket) Summary() string {
 	return fmt.Sprintf("SPP[v%d src=%s dst=%s hops=%d/%d path=%v status=%s payload=%dB]",
 		p.Version, p.SourceNode, p.Destination, p.HopCount, p.MaxHops,
 		p.PlannedPath, status, len(p.Payload))
+}
+
+// ──────────────────────────────────────────────────────────────
+// LightMode — packets without embedded topology.
+// ──────────────────────────────────────────────────────────────
+
+// NewLightPacket creates a packet that carries only path + intent,
+// no MiniMap. Routers use their own gossip-derived topology for
+// rerouting decisions, keeping packet size minimal (~100 bytes overhead).
+func NewLightPacket(destination string, intent IntentHeader, path []string, payload []byte) *SmartPacket {
+	return &SmartPacket{
+		Version:       ProtocolVersion,
+		PacketType:    PacketTypeData,
+		Destination:   destination,
+		Intent:        intent,
+		MiniMap:       nil,
+		LightMode:     true,
+		CurrentNode:   "",
+		PlannedPath:   path,
+		HopIndex:      0,
+		MaxHops:       DefaultMaxHops,
+		HopCount:      0,
+		Degraded:      false,
+		Rerouted:      false,
+		VisitedNodes:  make(map[string]bool),
+		CongestionLog: []HopRecord{},
+		Payload:       payload,
+	}
+}
+
+// ShouldRerouteFromTopology checks whether live conditions at currentNode
+// diverge from the router's local topology view. Used for LightMode packets
+// that carry no MiniMap.
+func (p *SmartPacket) ShouldRerouteFromTopology(currentNode string, currentLoad, currentLatency, threshold float64, localMap []Link) bool {
+	for _, link := range localMap {
+		if link.From != currentNode {
+			continue
+		}
+		if divergesWithFloor(currentLoad, link.LoadPct, threshold, DefaultMinDivergenceLoad) {
+			log.Info("load divergence detected (light)",
+				"node", currentNode,
+				"map_load", link.LoadPct,
+				"actual_load", currentLoad,
+			)
+			return true
+		}
+		if divergesWithFloor(currentLatency, link.LatencyMs, threshold, DefaultMinDivergenceLatencyMs) {
+			log.Info("latency divergence detected (light)",
+				"node", currentNode,
+				"map_latency_ms", link.LatencyMs,
+				"actual_latency_ms", currentLatency,
+			)
+			return true
+		}
+	}
+	return false
+}
+
+// RerouteFromTopology recalculates the path using the router's local
+// gossip topology instead of the packet's MiniMap. The packet's MiniMap
+// remains empty — only the PlannedPath is updated.
+func (p *SmartPacket) RerouteFromTopology(currentNode string, topology []Link) {
+	graph := BuildGraph(topology, p.Intent)
+	newPath := Dijkstra(graph, currentNode, p.Destination)
+
+	if len(newPath) > 0 {
+		p.PlannedPath = newPath
+		p.HopIndex = 0
+		p.Rerouted = true
+		log.Info("path recalculated (light)",
+			"from", currentNode,
+			"new_path", fmt.Sprintf("%v", newPath),
+		)
+	} else {
+		p.Degraded = true
+		log.Warn("no path found after reroute (light)",
+			"from", currentNode,
+			"destination", p.Destination,
+		)
+	}
+}
+
+// ForceForwardFromTopology selects the best next hop using the router's
+// local topology instead of the packet's MiniMap. Used for LightMode
+// packets during loop recovery.
+func (p *SmartPacket) ForceForwardFromTopology(currentNode string, topology []Link) string {
+	// 1. Direct link to destination
+	for _, link := range topology {
+		if link.From == currentNode && link.To == p.Destination {
+			return p.Destination
+		}
+	}
+
+	// 2. Least-weighted unvisited neighbor
+	bestNode := ""
+	bestWeight := math.Inf(1)
+	for _, link := range topology {
+		if link.From == currentNode && !p.VisitedNodes[link.To] {
+			weight := calculateWeight(link, p.Intent)
+			if weight < bestWeight {
+				bestWeight = weight
+				bestNode = link.To
+			}
+		}
+	}
+	if bestNode != "" {
+		return bestNode
+	}
+
+	// 3. Emergency — all visited
+	for _, link := range topology {
+		if link.From == currentNode {
+			weight := calculateWeight(link, p.Intent)
+			if weight < bestWeight {
+				bestWeight = weight
+				bestNode = link.To
+			}
+		}
+	}
+	return bestNode
 }
