@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"sync"
 	"time"
 
 	"smartpacket/connpool"
@@ -42,6 +43,17 @@ const (
 	// GetFreshLinks() when deciding whether gossip data is usable.
 	DefaultFreshnessMs = 3000
 
+	// DefaultRerouteCooldownMs is the minimum time (in ms) between
+	// consecutive reroute actions at this router. Prevents path
+	// flapping when network conditions oscillate rapidly.
+	DefaultRerouteCooldownMs = 2000
+
+	// DefaultWorkerCount is the number of goroutines processing packets.
+	DefaultWorkerCount = 4
+
+	// DefaultWorkerChanSize is the buffered channel size for the worker pool.
+	DefaultWorkerChanSize = 256
+
 	// DefaultMetricsPort is the fallback HTTP port for /metrics,
 	// /healthz, and /readyz endpoints.
 	DefaultMetricsPort = 9090
@@ -73,6 +85,8 @@ type NodeConfig struct {
 	WarnStalenessMs  int                       `json:"WarnStalenessMs"`
 	FreshnessMs      int                       `json:"FreshnessMs"`
 	MetricsPort      int                       `json:"MetricsPort"`      // HTTP port for /metrics, /healthz, /readyz
+	RerouteCooldownMs int                       `json:"RerouteCooldownMs"` // Minimum ms between reroutes (anti-flap)
+	WorkerCount      int                       `json:"WorkerCount"`      // Number of packet processing workers (default 4)
 	Neighbors        map[string]NeighborConfig `json:"Neighbors"`
 	NodeIDMap        map[string]uint16         `json:"NodeIDMap"`        // Compact node ID mapping for wire compression
 }
@@ -103,6 +117,12 @@ func (c *NodeConfig) applyDefaults() {
 	}
 	if c.MetricsPort == 0 {
 		c.MetricsPort = DefaultMetricsPort
+	}
+	if c.RerouteCooldownMs == 0 {
+		c.RerouteCooldownMs = DefaultRerouteCooldownMs
+	}
+	if c.WorkerCount == 0 {
+		c.WorkerCount = DefaultWorkerCount
 	}
 }
 
@@ -263,122 +283,189 @@ func main() {
 
 	pool := connpool.New()
 	defer pool.Close()
-	buf := make([]byte, UDPMaxPayload)
 
+	// Anti-flap: per-destination reroute cooldown tracking.
+	// Uses sync.Map to avoid mutex contention on the hot path —
+	// every packet was previously acquiring rerouteMu just to read
+	// the last reroute time, even when no reroute was needed.
+	var lastRerouteByDest sync.Map
+	rerouteCooldown := time.Duration(config.RerouteCooldownMs) * time.Millisecond
+	logger.Info("reroute cooldown active", "cooldown", rerouteCooldown)
+
+	// ── Worker pool ──
+	type work struct {
+		data []byte
+	}
+	workCh := make(chan work, DefaultWorkerChanSize)
+
+	for i := 0; i < config.WorkerCount; i++ {
+		go func(workerID int) {
+			for w := range workCh {
+				p, err := packet.DecodeWireWithIDs(w.data, nodeIDTable)
+				if err != nil {
+					logger.Warn("decode error", "worker", workerID, "err", err)
+					continue
+				}
+
+				prom.IncReceived()
+				forwardStart := time.Now()
+
+				slog.Debug("packet received",
+					"node", config.Name,
+					"dest", p.Destination,
+					"path", p.PlannedPath,
+					"hop", fmt.Sprintf("%d/%d", p.HopCount, p.MaxHops),
+				)
+
+				// ── Step 1: Check TTL ──
+				if p.IsExpired() {
+					logger.Warn("packet expired — dropping", "hops", p.HopCount, "max", p.MaxHops)
+					prom.IncDropped("expired")
+					continue
+				}
+
+				// ── Step 2: Determine next hop first, then look up that neighbor's latency ──
+				nextHop := p.NextHop()
+				if nextHop == "" {
+					nextHop = p.Destination
+				}
+
+				currentLoad := 0.0
+				currentLatency := 0.0
+				if metricsCollector != nil {
+					m := metricsCollector.GetMetrics()
+					currentLoad = m.LoadPct
+					// Use the specific next-hop neighbor's latency.
+					if pr, found := m.Neighbors[nextHop]; found {
+						currentLatency = pr.LatencyMs
+					}
+				}
+				p.LogHop(config.Name, currentLoad, currentLatency)
+				slog.Debug("stamped",
+					"node", config.Name,
+					"load", currentLoad,
+					"latency_ms", currentLatency,
+				)
+
+				// ── Step 3: Check for reroute (with per-destination cooldown) ──
+				isCritical := p.Intent.Priority >= 2
+				cooldownOk := true
+				if !isCritical {
+					if val, ok := lastRerouteByDest.Load(p.Destination); ok {
+						cooldownOk = time.Since(val.(time.Time)) >= rerouteCooldown
+					}
+				}
+
+				if p.LightMode {
+					// Cheap divergence pre-check: scans gossip state under RLock
+					// with zero allocations. Only if divergence is detected do we
+					// pay for GetFreshLinks (which allocates a []packet.Link slice).
+					effectiveThreshold := packet.RerouteThreshold
+					if p.Rerouted {
+						_, effectiveThreshold = packet.RerouteThresholdForIntent(p.Intent)
+					}
+					if topoState.CheckDivergence(config.Name, currentLoad, currentLatency, effectiveThreshold, packet.DefaultMinDivergenceLoad, packet.DefaultMinDivergenceLatencyMs) {
+						freshLinks := topoState.GetFreshLinks(freshnessThreshold)
+						if len(freshLinks) > 0 {
+							if cooldownOk {
+								logger.Info("conditions diverged — rerouting (light mode)", "dest", p.Destination)
+								p.RerouteFromTopology(config.Name, freshLinks)
+								logger.Info("rerouted", "new_path", p.PlannedPath)
+								lastRerouteByDest.Store(p.Destination, time.Now())
+								prom.IncReroutes()
+							} else {
+								slog.Debug("reroute suppressed — cooldown active",
+									"node", config.Name,
+									"dest", p.Destination)
+							}
+						}
+					}
+				} else if p.ShouldReroute(config.Name, currentLoad, currentLatency, packet.RerouteThreshold) {
+					if cooldownOk {
+						logger.Info("conditions diverged — rerouting", "dest", p.Destination)
+						freshLinks := topoState.GetFreshLinks(freshnessThreshold)
+						if len(freshLinks) > 0 {
+							p.Reroute(config.Name, freshLinks)
+							logger.Info("rerouted", "new_path", p.PlannedPath)
+							lastRerouteByDest.Store(p.Destination, time.Now())
+							prom.IncReroutes()
+						} else {
+							logger.Warn("no fresh gossip data for reroute")
+						}
+					} else {
+						slog.Debug("reroute suppressed — cooldown active",
+							"node", config.Name,
+							"dest", p.Destination)
+					}
+				}
+
+				// ── Step 4: Recalculate next hop (may have changed after reroute) ──
+				nextHop = p.NextHop()
+
+				// ── Step 5: Loop detection ──
+				if nextHop != "" && p.DetectLoop(nextHop) {
+					logger.Warn("loop detected — force-forwarding", "loop_node", nextHop)
+					prom.IncLoops()
+					if p.LightMode {
+						freshLinks := topoState.GetFreshLinks(freshnessThreshold)
+						nextHop = p.ForceForwardFromTopology(config.Name, freshLinks)
+					} else {
+						nextHop = p.ForceForward(config.Name)
+					}
+					p.Degraded = true
+					slog.Debug("force-forward", "node", config.Name, "next", nextHop)
+				}
+
+				if nextHop == "" {
+					nextHop = p.Destination
+				}
+
+				// ── Step 6: Find neighbor address and forward ──
+				neighbor, ok := config.Neighbors[nextHop]
+				if !ok {
+					logger.Warn("cannot find neighbor", "next_hop", nextHop)
+					prom.IncDropped("no_neighbor")
+					continue
+				}
+
+				var encoded []byte
+				if nodeIDTable != nil {
+					encoded, err = p.EncodeWireWithIDs(nodeIDTable)
+				} else {
+					encoded, err = p.EncodeWire()
+				}
+				if err != nil {
+					logger.Warn("encode error", "err", err)
+					prom.IncDropped("encode_error")
+					continue
+				}
+
+				if err := pool.Send(neighbor.DataAddr, encoded); err != nil {
+					logger.Warn("forward error", "addr", neighbor.DataAddr, "err", err)
+					continue
+				}
+				prom.IncForwarded()
+				prom.ObserveLatency(time.Since(forwardStart).Seconds())
+				prom.SetLoadPct(currentLoad)
+				slog.Debug("forwarded",
+					"node", config.Name,
+					"next_hop", nextHop,
+					"addr", neighbor.DataAddr,
+				)
+			}
+		}(i)
+	}
+
+	// ── Receive loop: read packets and dispatch to workers ──
+	buf := make([]byte, UDPMaxPayload)
 	for {
 		n, _, err := conn.ReadFromUDP(buf)
 		if err != nil {
 			continue
 		}
-
-		p, err := packet.DecodeWireWithIDs(buf[:n], nodeIDTable)
-		if err != nil {
-			logger.Warn("decode error", "err", err)
-			continue
-		}
-
-		prom.IncReceived()
-		forwardStart := time.Now()
-
-		logger.Info("packet received",
-			"dest", p.Destination,
-			"path", p.PlannedPath,
-			"hop", fmt.Sprintf("%d/%d", p.HopCount, p.MaxHops),
-		)
-
-		// ── Step 1: Check TTL ──
-		if p.IsExpired() {
-			logger.Warn("packet expired — dropping", "hops", p.HopCount, "max", p.MaxHops)
-			prom.IncDropped("expired")
-			continue
-		}
-
-		// ── Step 2: Stamp real congestion from metrics ──
-		currentLoad := 0.0
-		currentLatency := 0.0
-		if metricsCollector != nil {
-			m := metricsCollector.GetMetrics()
-			currentLoad = m.LoadPct
-			// Use average neighbor latency as representative.
-			for _, pr := range m.Neighbors {
-				currentLatency = pr.LatencyMs
-				break
-			}
-		}
-		p.LogHop(config.Name, currentLoad, currentLatency)
-		logger.Info("stamped", "load", currentLoad, "latency_ms", currentLatency)
-
-		// ── Step 3: Check for reroute ──
-		if p.LightMode {
-			// LightMode: packet has no MiniMap — use router's local gossip topology
-			freshLinks := topoState.GetFreshLinks(freshnessThreshold)
-			if len(freshLinks) > 0 && p.ShouldRerouteFromTopology(config.Name, currentLoad, currentLatency, packet.RerouteThreshold, freshLinks) {
-				logger.Info("conditions diverged — rerouting (light mode)")
-				p.RerouteFromTopology(config.Name, freshLinks)
-				logger.Info("rerouted", "new_path", p.PlannedPath)
-				prom.IncReroutes()
-			}
-		} else if p.ShouldReroute(config.Name, currentLoad, currentLatency, packet.RerouteThreshold) {
-			logger.Info("conditions diverged — rerouting")
-
-			freshLinks := topoState.GetFreshLinks(freshnessThreshold)
-			if len(freshLinks) > 0 {
-				p.Reroute(config.Name, freshLinks)
-				logger.Info("rerouted", "new_path", p.PlannedPath)
-				prom.IncReroutes()
-			} else {
-				logger.Warn("no fresh gossip data for reroute")
-			}
-		}
-
-		// ── Step 4: Determine next hop ──
-		nextHop := p.NextHop()
-
-		// ── Step 5: Loop detection ──
-		if nextHop != "" && p.DetectLoop(nextHop) {
-			logger.Warn("loop detected — force-forwarding", "loop_node", nextHop)
-			prom.IncLoops()
-			if p.LightMode {
-				freshLinks := topoState.GetFreshLinks(freshnessThreshold)
-				nextHop = p.ForceForwardFromTopology(config.Name, freshLinks)
-			} else {
-				nextHop = p.ForceForward(config.Name)
-			}
-			p.Degraded = true
-			logger.Info("force-forward", "next", nextHop)
-		}
-
-		if nextHop == "" {
-			nextHop = p.Destination
-		}
-
-		// ── Step 6: Find neighbor address and forward ──
-		neighbor, ok := config.Neighbors[nextHop]
-		if !ok {
-			logger.Warn("cannot find neighbor", "next_hop", nextHop)
-			prom.IncDropped("no_neighbor")
-			continue
-		}
-
-		var encoded []byte
-		if nodeIDTable != nil {
-			encoded, err = p.EncodeWireWithIDs(nodeIDTable)
-		} else {
-			encoded, err = p.EncodeWire()
-		}
-		if err != nil {
-			logger.Warn("encode error", "err", err)
-			prom.IncDropped("encode_error")
-			continue
-		}
-
-		if err := pool.Send(neighbor.DataAddr, encoded); err != nil {
-			logger.Warn("forward error", "addr", neighbor.DataAddr, "err", err)
-			continue
-		}
-		prom.IncForwarded()
-		prom.ObserveLatency(time.Since(forwardStart).Seconds())
-		prom.SetLoadPct(currentLoad)
-		logger.Info("forwarded", "next_hop", nextHop, "addr", neighbor.DataAddr)
+		// Copy buffer before dispatching to avoid data race.
+		pktData := make([]byte, n)
+		copy(pktData, buf[:n])
+		workCh <- work{data: pktData}
 	}
 }

@@ -41,6 +41,13 @@ const (
 	// difference (in ms) required to trigger a reroute.
 	DefaultMinDivergenceLatencyMs = 5.0
 
+	// DefaultRerouteReturnThresholdPct is the divergence threshold used
+	// when a packet has already been rerouted. It must be higher than
+	// DefaultRerouteThresholdPct to create a hysteresis band that
+	// prevents path flapping. The first reroute triggers at 30%, but
+	// switching back requires 50% divergence on the current path.
+	DefaultRerouteReturnThresholdPct = 50.0
+
 	// MaxReliability is the upper bound for IntentHeader.Reliability.
 	MaxReliability uint8 = 2
 	// MaxLatency is the upper bound for IntentHeader.Latency.
@@ -138,6 +145,21 @@ func (h IntentHeader) String() string {
 	return fmt.Sprintf("Intent{latency=%s reliability=%s priority=%s}", lat, rel, pri)
 }
 
+// RerouteThresholdForIntent returns the reroute trigger and return thresholds
+// based on the packet's intent. Critical-latency packets reroute more aggressively.
+func RerouteThresholdForIntent(intent IntentHeader) (trigger, returnThreshold float64) {
+	switch intent.Latency {
+	case 3: // critical
+		return 20.0, 30.0
+	case 2: // low
+		return 25.0, 40.0
+	case 1: // normal
+		return 30.0, 50.0
+	default: // relaxed
+		return 40.0, 60.0
+	}
+}
+
 // ──────────────────────────────────────────────────────────────
 // Link — one edge on the packet's mini-map.
 // ──────────────────────────────────────────────────────────────
@@ -186,6 +208,7 @@ type SmartPacket struct {
 
 	// Current routing state
 	CurrentNode string   // Where the packet is right now
+	PreviousHop string   // Node before CurrentNode (for loop avoidance in ForceForward)
 	PlannedPath []string // Computed shortest path
 	HopIndex    int      // Current position within PlannedPath
 
@@ -245,6 +268,9 @@ func (p *SmartPacket) LogHop(nodeName string, loadPct float64, latencyMs float64
 		LoadPct:   loadPct,
 		LatencyMs: latencyMs,
 	})
+
+	// Save previous hop before updating current node (for loop avoidance)
+	p.PreviousHop = p.CurrentNode
 	p.CurrentNode = nodeName
 	p.HopCount++
 
@@ -254,12 +280,10 @@ func (p *SmartPacket) LogHop(nodeName string, loadPct float64, latencyMs float64
 	}
 	p.VisitedNodes[nodeName] = true
 
-	// Advance hop index so NextHop() stays correct
-	for i, node := range p.PlannedPath {
-		if node == nodeName {
-			p.HopIndex = i
-			break
-		}
+	// Advance hop index (flaw 4.4 fix: simple increment + sanity check)
+	p.HopIndex++
+	if p.HopIndex >= len(p.PlannedPath) && len(p.PlannedPath) > 0 {
+		p.HopIndex = len(p.PlannedPath) - 1
 	}
 }
 
@@ -291,27 +315,37 @@ func (p *SmartPacket) UpdatePath(newPath []string) {
 //   - currentLatency: real measured latency ms at this link
 //   - threshold:      divergence percentage to trigger reroute (e.g., 30.0)
 func (p *SmartPacket) ShouldReroute(currentNode string, currentLoad, currentLatency, threshold float64) bool {
+	// Hysteresis: if already rerouted, require a higher divergence to
+	// switch again. This prevents path flapping when conditions oscillate
+	// near the threshold boundary.
+	effectiveThreshold := threshold
+	if p.Rerouted {
+		_, effectiveThreshold = RerouteThresholdForIntent(p.Intent)
+	}
+
 	for _, link := range p.MiniMap {
 		if link.From != currentNode {
 			continue
 		}
 
 		// Check load divergence (with absolute floor to avoid spurious triggers)
-		if divergesWithFloor(currentLoad, link.LoadPct, threshold, DefaultMinDivergenceLoad) {
+		if divergesWithFloor(currentLoad, link.LoadPct, effectiveThreshold, DefaultMinDivergenceLoad) {
 			log.Info("load divergence detected",
 				"node", currentNode,
 				"map_load", link.LoadPct,
 				"actual_load", currentLoad,
+				"threshold", effectiveThreshold,
 			)
 			return true
 		}
 
 		// Check latency divergence (with absolute floor)
-		if divergesWithFloor(currentLatency, link.LatencyMs, threshold, DefaultMinDivergenceLatencyMs) {
+		if divergesWithFloor(currentLatency, link.LatencyMs, effectiveThreshold, DefaultMinDivergenceLatencyMs) {
 			log.Info("latency divergence detected",
 				"node", currentNode,
 				"map_latency_ms", link.LatencyMs,
 				"actual_latency_ms", currentLatency,
+				"threshold", effectiveThreshold,
 			)
 			return true
 		}
@@ -346,42 +380,32 @@ func divergesWithFloor(actual, expected, thresholdPct, minAbsolute float64) bool
 }
 
 // Reroute recalculates the planned path from currentNode using freshLinks.
-// Fresh link data is merged into the packet's mini-map (fresher wins),
-// then Dijkstra is re-run from the current position.
+// Fresh gossip data is used directly — it is more complete and current
+// than the packet's stale MiniMap (which is why we're rerouting).
+// The MiniMap is replaced with fresh data so downstream hops have
+// an accurate topology view for their own ShouldReroute checks.
 func (p *SmartPacket) Reroute(currentNode string, freshLinks []Link) {
-	// Merge fresh data into the existing mini-map.
-	// Build a From→To→Link index so fresh data overwrites stale entries.
-	mergedMap := make(map[string]map[string]Link, len(p.MiniMap))
-	for _, link := range p.MiniMap {
-		if mergedMap[link.From] == nil {
-			mergedMap[link.From] = make(map[string]Link)
-		}
-		mergedMap[link.From][link.To] = link
-	}
-	for _, link := range freshLinks {
-		if mergedMap[link.From] == nil {
-			mergedMap[link.From] = make(map[string]Link)
-		}
-		mergedMap[link.From][link.To] = link
-	}
-
-	// Flatten back to a slice.
-	updatedMap := make([]Link, 0, len(p.MiniMap)+len(freshLinks))
-	for _, dests := range mergedMap {
-		for _, link := range dests {
-			updatedMap = append(updatedMap, link)
-		}
-	}
-	p.MiniMap = updatedMap
-
-	// Recalculate path from current position.
-	graph := BuildGraph(updatedMap, p.Intent)
+	// Use fresh gossip directly — skip the expensive merge step.
+	// The old MiniMap triggered this reroute, so it's stale by definition.
+	// Fresh gossip from the local router is always more current.
+	graph := BuildGraphForDest(freshLinks, p.Intent, p.Destination)
 	newPath := Dijkstra(graph, currentNode, p.Destination)
 
 	if len(newPath) > 0 {
+		// Skip reroute if the new path matches the remaining planned path.
+		// This avoids expensive MiniMap updates and re-encoding when
+		// divergence was detected but the optimal path hasn't changed.
+		if pathsEqual(newPath, p.RemainingPath()) {
+			log.Info("reroute skipped — same path",
+				"from", currentNode,
+				"path", fmt.Sprintf("%v", newPath),
+			)
+			return
+		}
 		p.PlannedPath = newPath
 		p.HopIndex = 0
 		p.Rerouted = true
+		p.MiniMap = freshLinks
 		log.Info("path recalculated",
 			"from", currentNode,
 			"new_path", fmt.Sprintf("%v", newPath),
@@ -394,6 +418,19 @@ func (p *SmartPacket) Reroute(currentNode string, freshLinks []Link) {
 			"destination", p.Destination,
 		)
 	}
+}
+
+// pathsEqual returns true if two string slices are identical.
+func pathsEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -434,11 +471,11 @@ func (p *SmartPacket) ForceForward(currentNode string) string {
 		}
 	}
 
-	// 2. Least-weighted unvisited neighbor (intent-aware)
+	// 2. Least-weighted unvisited neighbor, excluding PreviousHop
 	bestNode := ""
 	bestWeight := math.Inf(1)
 	for _, link := range p.MiniMap {
-		if link.From == currentNode && !p.VisitedNodes[link.To] {
+		if link.From == currentNode && !p.VisitedNodes[link.To] && link.To != p.PreviousHop {
 			weight := calculateWeight(link, p.Intent)
 			if weight < bestWeight {
 				bestWeight = weight
@@ -450,7 +487,21 @@ func (p *SmartPacket) ForceForward(currentNode string) string {
 		return bestNode
 	}
 
-	// 3. Emergency — all neighbors visited, pick lowest weight anyway.
+	// 3. Emergency — all neighbors visited, pick lowest weight but exclude PreviousHop.
+	for _, link := range p.MiniMap {
+		if link.From == currentNode && link.To != p.PreviousHop {
+			weight := calculateWeight(link, p.Intent)
+			if weight < bestWeight {
+				bestWeight = weight
+				bestNode = link.To
+			}
+		}
+	}
+	if bestNode != "" {
+		return bestNode
+	}
+
+	// 4. Last resort — even PreviousHop is acceptable to avoid being stuck.
 	for _, link := range p.MiniMap {
 		if link.From == currentNode {
 			weight := calculateWeight(link, p.Intent)
@@ -523,23 +574,32 @@ func NewLightPacket(destination string, intent IntentHeader, path []string, payl
 // diverge from the router's local topology view. Used for LightMode packets
 // that carry no MiniMap.
 func (p *SmartPacket) ShouldRerouteFromTopology(currentNode string, currentLoad, currentLatency, threshold float64, localMap []Link) bool {
+	// Hysteresis: if already rerouted, require a higher divergence to
+	// switch again (same logic as ShouldReroute).
+	effectiveThreshold := threshold
+	if p.Rerouted {
+		_, effectiveThreshold = RerouteThresholdForIntent(p.Intent)
+	}
+
 	for _, link := range localMap {
 		if link.From != currentNode {
 			continue
 		}
-		if divergesWithFloor(currentLoad, link.LoadPct, threshold, DefaultMinDivergenceLoad) {
+		if divergesWithFloor(currentLoad, link.LoadPct, effectiveThreshold, DefaultMinDivergenceLoad) {
 			log.Info("load divergence detected (light)",
 				"node", currentNode,
 				"map_load", link.LoadPct,
 				"actual_load", currentLoad,
+				"threshold", effectiveThreshold,
 			)
 			return true
 		}
-		if divergesWithFloor(currentLatency, link.LatencyMs, threshold, DefaultMinDivergenceLatencyMs) {
+		if divergesWithFloor(currentLatency, link.LatencyMs, effectiveThreshold, DefaultMinDivergenceLatencyMs) {
 			log.Info("latency divergence detected (light)",
 				"node", currentNode,
 				"map_latency_ms", link.LatencyMs,
 				"actual_latency_ms", currentLatency,
+				"threshold", effectiveThreshold,
 			)
 			return true
 		}
@@ -551,10 +611,18 @@ func (p *SmartPacket) ShouldRerouteFromTopology(currentNode string, currentLoad,
 // gossip topology instead of the packet's MiniMap. The packet's MiniMap
 // remains empty — only the PlannedPath is updated.
 func (p *SmartPacket) RerouteFromTopology(currentNode string, topology []Link) {
-	graph := BuildGraph(topology, p.Intent)
+	graph := BuildGraphForDest(topology, p.Intent, p.Destination)
 	newPath := Dijkstra(graph, currentNode, p.Destination)
 
 	if len(newPath) > 0 {
+		// Skip reroute if the optimal path hasn't changed.
+		if pathsEqual(newPath, p.RemainingPath()) {
+			log.Info("reroute skipped — same path",
+				"from", currentNode,
+				"path", fmt.Sprintf("%v", newPath),
+			)
+			return
+		}
 		p.PlannedPath = newPath
 		p.HopIndex = 0
 		p.Rerouted = true
@@ -582,11 +650,11 @@ func (p *SmartPacket) ForceForwardFromTopology(currentNode string, topology []Li
 		}
 	}
 
-	// 2. Least-weighted unvisited neighbor
+	// 2. Least-weighted unvisited neighbor, excluding PreviousHop
 	bestNode := ""
 	bestWeight := math.Inf(1)
 	for _, link := range topology {
-		if link.From == currentNode && !p.VisitedNodes[link.To] {
+		if link.From == currentNode && !p.VisitedNodes[link.To] && link.To != p.PreviousHop {
 			weight := calculateWeight(link, p.Intent)
 			if weight < bestWeight {
 				bestWeight = weight
@@ -598,7 +666,21 @@ func (p *SmartPacket) ForceForwardFromTopology(currentNode string, topology []Li
 		return bestNode
 	}
 
-	// 3. Emergency — all visited
+	// 3. Emergency — all visited, but still exclude PreviousHop
+	for _, link := range topology {
+		if link.From == currentNode && link.To != p.PreviousHop {
+			weight := calculateWeight(link, p.Intent)
+			if weight < bestWeight {
+				bestWeight = weight
+				bestNode = link.To
+			}
+		}
+	}
+	if bestNode != "" {
+		return bestNode
+	}
+
+	// 4. Last resort — even PreviousHop is acceptable to avoid being stuck.
 	for _, link := range topology {
 		if link.From == currentNode {
 			weight := calculateWeight(link, p.Intent)

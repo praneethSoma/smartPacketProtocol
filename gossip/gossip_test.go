@@ -280,12 +280,12 @@ func TestGossipMessageEncodeDecode(t *testing.T) {
 		IsDelta: true,
 	}
 
-	data, err := encodeGossipMessage(msg)
+	data, err := EncodeGossipMessage(msg)
 	if err != nil {
 		t.Fatalf("encode: %v", err)
 	}
 
-	decoded, err := decodeGossipMessage(data)
+	decoded, err := DecodeGossipMessage(data)
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}

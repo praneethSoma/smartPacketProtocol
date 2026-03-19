@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 )
 
 // ──────────────────────────────────────────────────────────────
@@ -69,7 +70,8 @@ const (
 	FlagDegraded  uint8 = 0x01 // Bit 0: packet took a suboptimal path
 	FlagRerouted  uint8 = 0x02 // Bit 1: path was recalculated mid-flight
 	FlagLightMode  uint8 = 0x04 // Bit 2: no MiniMap — routers use local gossip
-	FlagCompactIDs uint8 = 0x08 // Bit 3: node names encoded as uint16 IDs
+	FlagCompactIDs      uint8 = 0x08 // Bit 3: node names encoded as uint16 IDs
+	FlagCompactMetrics  uint8 = 0x10 // Bit 4: metrics as uint16 fixed-point (×100) instead of float64
 )
 
 // WireHeader is the fixed-size header at the start of every SPP frame.
@@ -90,103 +92,85 @@ type WireHeader struct {
 // EncodeWire serializes a SmartPacket into the SPP binary wire format.
 // Returns the complete frame (fixed header + variable header + payload).
 func (p *SmartPacket) EncodeWire() ([]byte, error) {
-	// -- Variable header --
-	var hdr bytes.Buffer
+	// Estimate total size to do a single allocation.
+	// Fixed header(16) + intent(4) + meta(5) + dest/current(4+2*~10)
+	// + path(2+N*~12) + hopidx(2) + map(2+N*~34) + log(2+N*~26)
+	// + visited(2+N*~12) + timestamp(8) + payload
+	est := WireHeaderSize + 32
+	for _, node := range p.PlannedPath {
+		est += 2 + len(node)
+	}
+	for _, link := range p.MiniMap {
+		est += 2 + len(link.From) + 2 + len(link.To) + 24
+	}
+	for _, hop := range p.CongestionLog {
+		est += 2 + len(hop.NodeName) + 16
+	}
+	for node := range p.VisitedNodes {
+		est += 2 + len(node)
+	}
+	est += 2 + len(p.Destination) + 2 + len(p.CurrentNode) + 2 + len(p.SourceNode)
+	est += len(p.Payload) + 10
 
-	// Intent (4 bytes, fixed).
-	hdr.WriteByte(p.Intent.Reliability)
-	hdr.WriteByte(p.Intent.Latency)
-	hdr.WriteByte(p.Intent.Ordering)
-	hdr.WriteByte(p.Intent.Priority)
+	buf := make([]byte, 0, est)
 
-	// Routing metadata (5 bytes, fixed).
-	hdr.WriteByte(p.Version)
-	hdr.WriteByte(p.PacketType)
-	hdr.WriteByte(p.MaxHops)
-	hdr.WriteByte(p.HopCount)
+	// Reserve space for fixed header (filled at the end).
+	buf = buf[:WireHeaderSize]
+
+	// -- Variable header (appended directly) --
+	hdrStart := WireHeaderSize
+
+	// Intent (4 bytes).
+	buf = append(buf, p.Intent.Reliability, p.Intent.Latency, p.Intent.Ordering, p.Intent.Priority)
+
+	// Routing metadata (5 bytes).
+	degradedByte := byte(0)
 	if p.Degraded {
-		hdr.WriteByte(1)
-	} else {
-		hdr.WriteByte(0)
+		degradedByte = 1
 	}
+	buf = append(buf, p.Version, p.PacketType, p.MaxHops, p.HopCount, degradedByte)
 
-	// Destination + current node (length-prefixed strings).
-	if err := binWriteString(&hdr, p.Destination); err != nil {
-		return nil, fmt.Errorf("encode destination: %w", err)
-	}
-	if err := binWriteString(&hdr, p.CurrentNode); err != nil {
-		return nil, fmt.Errorf("encode current_node: %w", err)
-	}
+	// Destination + current node.
+	buf = appendString(buf, p.Destination)
+	buf = appendString(buf, p.CurrentNode)
 
 	// Planned path.
-	if err := binary.Write(&hdr, binary.BigEndian, uint16(len(p.PlannedPath))); err != nil {
-		return nil, fmt.Errorf("encode path_len: %w", err)
-	}
-	for i, node := range p.PlannedPath {
-		if err := binWriteString(&hdr, node); err != nil {
-			return nil, fmt.Errorf("encode path[%d]: %w", i, err)
-		}
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(p.PlannedPath)))
+	for _, node := range p.PlannedPath {
+		buf = appendString(buf, node)
 	}
 
 	// Hop index.
-	if err := binary.Write(&hdr, binary.BigEndian, uint16(p.HopIndex)); err != nil {
-		return nil, fmt.Errorf("encode hop_index: %w", err)
-	}
+	buf = binary.BigEndian.AppendUint16(buf, uint16(p.HopIndex))
 
 	// Mini map.
-	if err := binary.Write(&hdr, binary.BigEndian, uint16(len(p.MiniMap))); err != nil {
-		return nil, fmt.Errorf("encode map_len: %w", err)
-	}
-	for i, link := range p.MiniMap {
-		if err := binWriteString(&hdr, link.From); err != nil {
-			return nil, fmt.Errorf("encode map[%d].from: %w", i, err)
-		}
-		if err := binWriteString(&hdr, link.To); err != nil {
-			return nil, fmt.Errorf("encode map[%d].to: %w", i, err)
-		}
-		if err := binary.Write(&hdr, binary.BigEndian, link.LatencyMs); err != nil {
-			return nil, fmt.Errorf("encode map[%d].latency: %w", i, err)
-		}
-		if err := binary.Write(&hdr, binary.BigEndian, link.LoadPct); err != nil {
-			return nil, fmt.Errorf("encode map[%d].load: %w", i, err)
-		}
-		if err := binary.Write(&hdr, binary.BigEndian, link.LossPct); err != nil {
-			return nil, fmt.Errorf("encode map[%d].loss: %w", i, err)
-		}
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(p.MiniMap)))
+	for _, link := range p.MiniMap {
+		buf = appendString(buf, link.From)
+		buf = appendString(buf, link.To)
+		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(link.LatencyMs))
+		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(link.LoadPct))
+		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(link.LossPct))
 	}
 
 	// Congestion log.
-	if err := binary.Write(&hdr, binary.BigEndian, uint16(len(p.CongestionLog))); err != nil {
-		return nil, fmt.Errorf("encode log_len: %w", err)
-	}
-	for i, hop := range p.CongestionLog {
-		if err := binWriteString(&hdr, hop.NodeName); err != nil {
-			return nil, fmt.Errorf("encode log[%d].name: %w", i, err)
-		}
-		if err := binary.Write(&hdr, binary.BigEndian, hop.LoadPct); err != nil {
-			return nil, fmt.Errorf("encode log[%d].load: %w", i, err)
-		}
-		if err := binary.Write(&hdr, binary.BigEndian, hop.LatencyMs); err != nil {
-			return nil, fmt.Errorf("encode log[%d].latency: %w", i, err)
-		}
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(p.CongestionLog)))
+	for _, hop := range p.CongestionLog {
+		buf = appendString(buf, hop.NodeName)
+		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(hop.LoadPct))
+		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(hop.LatencyMs))
 	}
 
 	// Visited nodes.
-	if err := binary.Write(&hdr, binary.BigEndian, uint16(len(p.VisitedNodes))); err != nil {
-		return nil, fmt.Errorf("encode visited_len: %w", err)
-	}
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(p.VisitedNodes)))
 	for node := range p.VisitedNodes {
-		if err := binWriteString(&hdr, node); err != nil {
-			return nil, fmt.Errorf("encode visited node: %w", err)
-		}
+		buf = appendString(buf, node)
 	}
 
 	// Timestamp (8 bytes).
-	if err := binary.Write(&hdr, binary.BigEndian, p.CreatedAtNs); err != nil {
-		return nil, fmt.Errorf("encode created_at: %w", err)
-	}
+	buf = binary.BigEndian.AppendUint64(buf, uint64(p.CreatedAtNs))
 
-	headerData := hdr.Bytes()
+	headerData := buf[hdrStart:]
 
 	// -- Flags --
 	var flags uint8
@@ -201,27 +185,32 @@ func (p *SmartPacket) EncodeWire() ([]byte, error) {
 	}
 
 	// -- CRC32 over (variable header + payload) --
-	crcBuf := make([]byte, len(headerData)+len(p.Payload))
-	copy(crcBuf, headerData)
-	copy(crcBuf[len(headerData):], p.Payload)
-	checksum := crc32.ChecksumIEEE(crcBuf)
+	h := crc32.NewIEEE()
+	h.Write(headerData)
+	h.Write(p.Payload)
+	checksum := h.Sum32()
 
-	// -- Assemble fixed header + variable header + payload --
-	var out bytes.Buffer
-	out.Grow(WireHeaderSize + len(headerData) + len(p.Payload))
+	// -- Fill fixed header --
+	buf[0] = MagicByte1
+	buf[1] = MagicByte2
+	buf[2] = MagicByte3
+	buf[3] = ProtocolVersion
+	buf[4] = p.PacketType
+	buf[5] = flags
+	binary.BigEndian.PutUint16(buf[6:8], uint16(len(headerData)))
+	binary.BigEndian.PutUint32(buf[8:12], uint32(len(p.Payload)))
+	binary.BigEndian.PutUint32(buf[12:16], checksum)
 
-	out.Write([]byte{MagicByte1, MagicByte2, MagicByte3})
-	out.WriteByte(ProtocolVersion)
-	out.WriteByte(p.PacketType)
-	out.WriteByte(flags)
-	binary.Write(&out, binary.BigEndian, uint16(len(headerData)))
-	binary.Write(&out, binary.BigEndian, uint32(len(p.Payload)))
-	binary.Write(&out, binary.BigEndian, checksum)
+	// Append payload.
+	buf = append(buf, p.Payload...)
 
-	out.Write(headerData)
-	out.Write(p.Payload)
+	return buf, nil
+}
 
-	return out.Bytes(), nil
+// appendString appends a uint16-length-prefixed string to buf.
+func appendString(buf []byte, s string) []byte {
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(s)))
+	return append(buf, s...)
 }
 
 // ──────────────────────────────────────────────────────────────
@@ -248,73 +237,116 @@ func DecodeWire(data []byte) (*SmartPacket, error) {
 
 	packetType := data[4]
 	flags := data[5]
-	headerLen := binary.BigEndian.Uint16(data[6:8])
-	payloadLen := binary.BigEndian.Uint32(data[8:12])
+	headerLen := int(binary.BigEndian.Uint16(data[6:8]))
+	payloadLen := int(binary.BigEndian.Uint32(data[8:12]))
 	checksum := binary.BigEndian.Uint32(data[12:16])
 
 	// -- Size safety checks --
-	if int(headerLen) > MaxHeaderSize {
+	if headerLen > MaxHeaderSize {
 		return nil, fmt.Errorf("header too large: %d bytes (max %d)", headerLen, MaxHeaderSize)
 	}
-	if int(payloadLen) > MaxPayloadSize {
+	if payloadLen > MaxPayloadSize {
 		return nil, fmt.Errorf("payload too large: %d bytes (max %d)", payloadLen, MaxPayloadSize)
 	}
 
-	totalExpected := WireHeaderSize + int(headerLen) + int(payloadLen)
+	totalExpected := WireHeaderSize + headerLen + payloadLen
 	if len(data) < totalExpected {
 		return nil, fmt.Errorf("packet truncated: got %d bytes, expected %d", len(data), totalExpected)
 	}
 
-	headerData := data[WireHeaderSize : WireHeaderSize+int(headerLen)]
-	payloadData := data[WireHeaderSize+int(headerLen) : totalExpected]
+	headerData := data[WireHeaderSize : WireHeaderSize+headerLen]
+	payloadData := data[WireHeaderSize+headerLen : totalExpected]
 
 	// -- CRC32 integrity check --
-	crcBuf := make([]byte, len(headerData)+len(payloadData))
-	copy(crcBuf, headerData)
-	copy(crcBuf[len(headerData):], payloadData)
-	if crc32.ChecksumIEEE(crcBuf) != checksum {
+	h := crc32.NewIEEE()
+	h.Write(headerData)
+	h.Write(payloadData)
+	if h.Sum32() != checksum {
 		return nil, fmt.Errorf("CRC32 checksum mismatch: frame corrupted")
 	}
 
-	// -- Parse variable header --
-	r := bytes.NewReader(headerData)
+	// -- Parse variable header using direct offset access --
+	d := headerData
+	off := 0
+
+	need := func(n int) error {
+		if off+n > len(d) {
+			return fmt.Errorf("header truncated at offset %d (need %d more bytes)", off, n)
+		}
+		return nil
+	}
+
+	readU16 := func() (uint16, error) {
+		if err := need(2); err != nil {
+			return 0, err
+		}
+		v := binary.BigEndian.Uint16(d[off : off+2])
+		off += 2
+		return v, nil
+	}
+
+	readU64 := func() (uint64, error) {
+		if err := need(8); err != nil {
+			return 0, err
+		}
+		v := binary.BigEndian.Uint64(d[off : off+8])
+		off += 8
+		return v, nil
+	}
+
+	readFloat64 := func() (float64, error) {
+		v, err := readU64()
+		return math.Float64frombits(v), err
+	}
+
+	readStr := func() (string, error) {
+		slen, err := readU16()
+		if err != nil {
+			return "", err
+		}
+		if int(slen) > MaxStringLen {
+			return "", fmt.Errorf("string length %d exceeds max %d", slen, MaxStringLen)
+		}
+		if err := need(int(slen)); err != nil {
+			return "", err
+		}
+		s := string(d[off : off+int(slen)])
+		off += int(slen)
+		return s, nil
+	}
+
 	p := &SmartPacket{}
 
 	// Intent (4 bytes).
-	var intentBytes [4]byte
-	if _, err := io.ReadFull(r, intentBytes[:]); err != nil {
+	if err := need(4); err != nil {
 		return nil, fmt.Errorf("read intent: %w", err)
 	}
-	p.Intent = IntentHeader{
-		Reliability: intentBytes[0],
-		Latency:     intentBytes[1],
-		Ordering:    intentBytes[2],
-		Priority:    intentBytes[3],
-	}
+	p.Intent = IntentHeader{d[off], d[off+1], d[off+2], d[off+3]}
+	off += 4
 
 	// Routing metadata (5 bytes).
-	var metaBytes [5]byte
-	if _, err := io.ReadFull(r, metaBytes[:]); err != nil {
+	if err := need(5); err != nil {
 		return nil, fmt.Errorf("read routing metadata: %w", err)
 	}
-	p.Version = metaBytes[0]
-	p.PacketType = metaBytes[1]
-	p.MaxHops = metaBytes[2]
-	p.HopCount = metaBytes[3]
-	p.Degraded = metaBytes[4] == 1
+	p.Version = d[off]
+	p.PacketType = d[off+1]
+	p.MaxHops = d[off+2]
+	p.HopCount = d[off+3]
+	p.Degraded = d[off+4] == 1
+	off += 5
 
 	// Destination + current node.
 	var err error
-	if p.Destination, err = binReadString(r); err != nil {
+	if p.Destination, err = readStr(); err != nil {
 		return nil, fmt.Errorf("read destination: %w", err)
 	}
-	if p.CurrentNode, err = binReadString(r); err != nil {
+	if p.CurrentNode, err = readStr(); err != nil {
 		return nil, fmt.Errorf("read current_node: %w", err)
 	}
 
 	// Planned path.
-	var pathLen uint16
-	if err := binary.Read(r, binary.BigEndian, &pathLen); err != nil {
+	pathLen, err := readU16()
+	if err != nil {
 		return nil, fmt.Errorf("read path_len: %w", err)
 	}
 	if int(pathLen) > MaxPathLen {
@@ -322,21 +354,21 @@ func DecodeWire(data []byte) (*SmartPacket, error) {
 	}
 	p.PlannedPath = make([]string, pathLen)
 	for i := range p.PlannedPath {
-		if p.PlannedPath[i], err = binReadString(r); err != nil {
+		if p.PlannedPath[i], err = readStr(); err != nil {
 			return nil, fmt.Errorf("read path[%d]: %w", i, err)
 		}
 	}
 
 	// Hop index.
-	var hopIdx uint16
-	if err := binary.Read(r, binary.BigEndian, &hopIdx); err != nil {
+	hopIdx, err := readU16()
+	if err != nil {
 		return nil, fmt.Errorf("read hop_index: %w", err)
 	}
 	p.HopIndex = int(hopIdx)
 
 	// Mini map.
-	var mapLen uint16
-	if err := binary.Read(r, binary.BigEndian, &mapLen); err != nil {
+	mapLen, err := readU16()
+	if err != nil {
 		return nil, fmt.Errorf("read map_len: %w", err)
 	}
 	if int(mapLen) > MaxMiniMapSize {
@@ -344,26 +376,26 @@ func DecodeWire(data []byte) (*SmartPacket, error) {
 	}
 	p.MiniMap = make([]Link, mapLen)
 	for i := range p.MiniMap {
-		if p.MiniMap[i].From, err = binReadString(r); err != nil {
+		if p.MiniMap[i].From, err = readStr(); err != nil {
 			return nil, fmt.Errorf("read map[%d].from: %w", i, err)
 		}
-		if p.MiniMap[i].To, err = binReadString(r); err != nil {
+		if p.MiniMap[i].To, err = readStr(); err != nil {
 			return nil, fmt.Errorf("read map[%d].to: %w", i, err)
 		}
-		if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LatencyMs); err != nil {
+		if p.MiniMap[i].LatencyMs, err = readFloat64(); err != nil {
 			return nil, fmt.Errorf("read map[%d].latency: %w", i, err)
 		}
-		if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LoadPct); err != nil {
+		if p.MiniMap[i].LoadPct, err = readFloat64(); err != nil {
 			return nil, fmt.Errorf("read map[%d].load: %w", i, err)
 		}
-		if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LossPct); err != nil {
+		if p.MiniMap[i].LossPct, err = readFloat64(); err != nil {
 			return nil, fmt.Errorf("read map[%d].loss: %w", i, err)
 		}
 	}
 
 	// Congestion log.
-	var logLen uint16
-	if err := binary.Read(r, binary.BigEndian, &logLen); err != nil {
+	logLen, err := readU16()
+	if err != nil {
 		return nil, fmt.Errorf("read log_len: %w", err)
 	}
 	if int(logLen) > MaxCongestionLogSize {
@@ -371,20 +403,20 @@ func DecodeWire(data []byte) (*SmartPacket, error) {
 	}
 	p.CongestionLog = make([]HopRecord, logLen)
 	for i := range p.CongestionLog {
-		if p.CongestionLog[i].NodeName, err = binReadString(r); err != nil {
+		if p.CongestionLog[i].NodeName, err = readStr(); err != nil {
 			return nil, fmt.Errorf("read log[%d].name: %w", i, err)
 		}
-		if err := binary.Read(r, binary.BigEndian, &p.CongestionLog[i].LoadPct); err != nil {
+		if p.CongestionLog[i].LoadPct, err = readFloat64(); err != nil {
 			return nil, fmt.Errorf("read log[%d].load: %w", i, err)
 		}
-		if err := binary.Read(r, binary.BigEndian, &p.CongestionLog[i].LatencyMs); err != nil {
+		if p.CongestionLog[i].LatencyMs, err = readFloat64(); err != nil {
 			return nil, fmt.Errorf("read log[%d].latency: %w", i, err)
 		}
 	}
 
 	// Visited nodes.
-	var visitedLen uint16
-	if err := binary.Read(r, binary.BigEndian, &visitedLen); err != nil {
+	visitedLen, err := readU16()
+	if err != nil {
 		return nil, fmt.Errorf("read visited_len: %w", err)
 	}
 	if int(visitedLen) > MaxVisitedNodes {
@@ -392,7 +424,7 @@ func DecodeWire(data []byte) (*SmartPacket, error) {
 	}
 	p.VisitedNodes = make(map[string]bool, visitedLen)
 	for i := 0; i < int(visitedLen); i++ {
-		node, err := binReadString(r)
+		node, err := readStr()
 		if err != nil {
 			return nil, fmt.Errorf("read visited[%d]: %w", i, err)
 		}
@@ -400,9 +432,11 @@ func DecodeWire(data []byte) (*SmartPacket, error) {
 	}
 
 	// Timestamp (8 bytes).
-	if err := binary.Read(r, binary.BigEndian, &p.CreatedAtNs); err != nil {
+	tsVal, err := readU64()
+	if err != nil {
 		return nil, fmt.Errorf("read created_at: %w", err)
 	}
+	p.CreatedAtNs = int64(tsVal)
 
 	// -- Apply fixed header fields --
 	p.PacketType = packetType
@@ -423,6 +457,30 @@ func DecodeWire(data []byte) (*SmartPacket, error) {
 // ──────────────────────────────────────────────────────────────
 // Compact ID encode / decode
 // ──────────────────────────────────────────────────────────────
+
+// ──────────────────────────────────────────────────────────────
+// Compact metric helpers — float64 ↔ uint16 fixed-point (×100)
+//
+// Latency: 0.01ms precision, max 655.35ms (sufficient for LAN/DC)
+// Load:    0.01% precision,  max 655.35%
+// Loss:    0.01% precision,  max 655.35%
+// ──────────────────────────────────────────────────────────────
+
+func encodeMetricU16(w *bytes.Buffer, val float64) error {
+	scaled := uint16(val * 100)
+	if val*100 > 65535 {
+		scaled = 65535
+	}
+	return binary.Write(w, binary.BigEndian, scaled)
+}
+
+func decodeMetricU16(r *bytes.Reader) (float64, error) {
+	var scaled uint16
+	if err := binary.Read(r, binary.BigEndian, &scaled); err != nil {
+		return 0, err
+	}
+	return float64(scaled) / 100.0, nil
+}
 
 // binWriteNodeID writes a node name as a uint16 compact ID.
 // ID 0 is reserved as a sentinel for empty strings (e.g., CurrentNode
@@ -471,16 +529,11 @@ func (p *SmartPacket) EncodeWireWithIDs(nit *NodeIDTable) ([]byte, error) {
 	hdr.WriteByte(p.Intent.Ordering)
 	hdr.WriteByte(p.Intent.Priority)
 
-	// Routing metadata (5 bytes, fixed).
+	// Routing metadata (4 bytes — Degraded is in the flags byte, not repeated here).
 	hdr.WriteByte(p.Version)
 	hdr.WriteByte(p.PacketType)
 	hdr.WriteByte(p.MaxHops)
 	hdr.WriteByte(p.HopCount)
-	if p.Degraded {
-		hdr.WriteByte(1)
-	} else {
-		hdr.WriteByte(0)
-	}
 
 	// Destination + current node (compact IDs).
 	if err := binWriteNodeID(&hdr, p.Destination, nit); err != nil {
@@ -516,13 +569,13 @@ func (p *SmartPacket) EncodeWireWithIDs(nit *NodeIDTable) ([]byte, error) {
 		if err := binWriteNodeID(&hdr, link.To, nit); err != nil {
 			return nil, fmt.Errorf("encode map[%d].to: %w", i, err)
 		}
-		if err := binary.Write(&hdr, binary.BigEndian, link.LatencyMs); err != nil {
+		if err := encodeMetricU16(&hdr, link.LatencyMs); err != nil {
 			return nil, fmt.Errorf("encode map[%d].latency: %w", i, err)
 		}
-		if err := binary.Write(&hdr, binary.BigEndian, link.LoadPct); err != nil {
+		if err := encodeMetricU16(&hdr, link.LoadPct); err != nil {
 			return nil, fmt.Errorf("encode map[%d].load: %w", i, err)
 		}
-		if err := binary.Write(&hdr, binary.BigEndian, link.LossPct); err != nil {
+		if err := encodeMetricU16(&hdr, link.LossPct); err != nil {
 			return nil, fmt.Errorf("encode map[%d].loss: %w", i, err)
 		}
 	}
@@ -535,10 +588,10 @@ func (p *SmartPacket) EncodeWireWithIDs(nit *NodeIDTable) ([]byte, error) {
 		if err := binWriteNodeID(&hdr, hop.NodeName, nit); err != nil {
 			return nil, fmt.Errorf("encode log[%d].name: %w", i, err)
 		}
-		if err := binary.Write(&hdr, binary.BigEndian, hop.LoadPct); err != nil {
+		if err := encodeMetricU16(&hdr, hop.LoadPct); err != nil {
 			return nil, fmt.Errorf("encode log[%d].load: %w", i, err)
 		}
-		if err := binary.Write(&hdr, binary.BigEndian, hop.LatencyMs); err != nil {
+		if err := encodeMetricU16(&hdr, hop.LatencyMs); err != nil {
 			return nil, fmt.Errorf("encode log[%d].latency: %w", i, err)
 		}
 	}
@@ -572,12 +625,13 @@ func (p *SmartPacket) EncodeWireWithIDs(nit *NodeIDTable) ([]byte, error) {
 		flags |= FlagLightMode
 	}
 	flags |= FlagCompactIDs
+	flags |= FlagCompactMetrics
 
-	// -- CRC32 over (variable header + payload) --
-	crcBuf := make([]byte, len(headerData)+len(p.Payload))
-	copy(crcBuf, headerData)
-	copy(crcBuf[len(headerData):], p.Payload)
-	checksum := crc32.ChecksumIEEE(crcBuf)
+	// -- CRC32 over (variable header + payload) -- streaming, no extra alloc
+	h := crc32.NewIEEE()
+	h.Write(headerData)
+	h.Write(p.Payload)
+	checksum := h.Sum32()
 
 	// -- Assemble fixed header + variable header + payload --
 	var out bytes.Buffer
@@ -646,13 +700,15 @@ func DecodeWireWithIDs(data []byte, nit *NodeIDTable) (*SmartPacket, error) {
 	headerData := data[WireHeaderSize : WireHeaderSize+int(headerLen)]
 	payloadData := data[WireHeaderSize+int(headerLen) : totalExpected]
 
-	// -- CRC32 integrity check --
-	crcBuf := make([]byte, len(headerData)+len(payloadData))
-	copy(crcBuf, headerData)
-	copy(crcBuf[len(headerData):], payloadData)
-	if crc32.ChecksumIEEE(crcBuf) != checksum {
+	// -- CRC32 integrity check -- streaming, no extra alloc
+	h := crc32.NewIEEE()
+	h.Write(headerData)
+	h.Write(payloadData)
+	if h.Sum32() != checksum {
 		return nil, fmt.Errorf("CRC32 checksum mismatch: frame corrupted")
 	}
+
+	compactMetrics := flags&FlagCompactMetrics != 0
 
 	// -- Parse variable header with compact IDs --
 	r := bytes.NewReader(headerData)
@@ -670,8 +726,8 @@ func DecodeWireWithIDs(data []byte, nit *NodeIDTable) (*SmartPacket, error) {
 		Priority:    intentBytes[3],
 	}
 
-	// Routing metadata (5 bytes).
-	var metaBytes [5]byte
+	// Routing metadata (4 bytes — Degraded is in the flags byte when compact metrics are used).
+	var metaBytes [4]byte
 	if _, err := io.ReadFull(r, metaBytes[:]); err != nil {
 		return nil, fmt.Errorf("read routing metadata: %w", err)
 	}
@@ -679,7 +735,6 @@ func DecodeWireWithIDs(data []byte, nit *NodeIDTable) (*SmartPacket, error) {
 	p.PacketType = metaBytes[1]
 	p.MaxHops = metaBytes[2]
 	p.HopCount = metaBytes[3]
-	p.Degraded = metaBytes[4] == 1
 
 	// Destination + current node (compact IDs).
 	var err error
@@ -728,14 +783,26 @@ func DecodeWireWithIDs(data []byte, nit *NodeIDTable) (*SmartPacket, error) {
 		if p.MiniMap[i].To, err = binReadNodeID(r, nit); err != nil {
 			return nil, fmt.Errorf("read map[%d].to: %w", i, err)
 		}
-		if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LatencyMs); err != nil {
-			return nil, fmt.Errorf("read map[%d].latency: %w", i, err)
-		}
-		if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LoadPct); err != nil {
-			return nil, fmt.Errorf("read map[%d].load: %w", i, err)
-		}
-		if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LossPct); err != nil {
-			return nil, fmt.Errorf("read map[%d].loss: %w", i, err)
+		if compactMetrics {
+			if p.MiniMap[i].LatencyMs, err = decodeMetricU16(r); err != nil {
+				return nil, fmt.Errorf("read map[%d].latency: %w", i, err)
+			}
+			if p.MiniMap[i].LoadPct, err = decodeMetricU16(r); err != nil {
+				return nil, fmt.Errorf("read map[%d].load: %w", i, err)
+			}
+			if p.MiniMap[i].LossPct, err = decodeMetricU16(r); err != nil {
+				return nil, fmt.Errorf("read map[%d].loss: %w", i, err)
+			}
+		} else {
+			if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LatencyMs); err != nil {
+				return nil, fmt.Errorf("read map[%d].latency: %w", i, err)
+			}
+			if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LoadPct); err != nil {
+				return nil, fmt.Errorf("read map[%d].load: %w", i, err)
+			}
+			if err := binary.Read(r, binary.BigEndian, &p.MiniMap[i].LossPct); err != nil {
+				return nil, fmt.Errorf("read map[%d].loss: %w", i, err)
+			}
 		}
 	}
 
@@ -752,11 +819,20 @@ func DecodeWireWithIDs(data []byte, nit *NodeIDTable) (*SmartPacket, error) {
 		if p.CongestionLog[i].NodeName, err = binReadNodeID(r, nit); err != nil {
 			return nil, fmt.Errorf("read log[%d].name: %w", i, err)
 		}
-		if err := binary.Read(r, binary.BigEndian, &p.CongestionLog[i].LoadPct); err != nil {
-			return nil, fmt.Errorf("read log[%d].load: %w", i, err)
-		}
-		if err := binary.Read(r, binary.BigEndian, &p.CongestionLog[i].LatencyMs); err != nil {
-			return nil, fmt.Errorf("read log[%d].latency: %w", i, err)
+		if compactMetrics {
+			if p.CongestionLog[i].LoadPct, err = decodeMetricU16(r); err != nil {
+				return nil, fmt.Errorf("read log[%d].load: %w", i, err)
+			}
+			if p.CongestionLog[i].LatencyMs, err = decodeMetricU16(r); err != nil {
+				return nil, fmt.Errorf("read log[%d].latency: %w", i, err)
+			}
+		} else {
+			if err := binary.Read(r, binary.BigEndian, &p.CongestionLog[i].LoadPct); err != nil {
+				return nil, fmt.Errorf("read log[%d].load: %w", i, err)
+			}
+			if err := binary.Read(r, binary.BigEndian, &p.CongestionLog[i].LatencyMs); err != nil {
+				return nil, fmt.Errorf("read log[%d].latency: %w", i, err)
+			}
 		}
 	}
 

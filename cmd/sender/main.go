@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
-	"encoding/gob"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -49,6 +47,8 @@ type SenderConfig struct {
 	RawMode              bool              `json:"RawMode"`              // If true, send raw 8-byte timestamp (no SPP framing) for overhead measurement
 	LightMode            bool              `json:"LightMode"`            // If true, don't embed MiniMap — routers use local gossip for rerouting
 	NodeIDMap            map[string]uint16 `json:"NodeIDMap"`            // Compact node ID mapping for wire compression
+	OSPFMode             bool              `json:"OSPFMode"`             // OSPF simulation: single-metric Dijkstra, no rerouting, convergence delay
+	OSPFConvergenceMs    int               `json:"OSPFConvergenceMs"`    // Simulated OSPF convergence delay in ms (default: 0, realistic: 1000-5000)
 }
 
 // applyDefaults fills zero-valued fields with production defaults.
@@ -123,6 +123,106 @@ func main() {
 		// so it always follows the fixed path regardless of congestion.
 		path = config.StaticPath
 		logger.Info("static baseline mode — gossip skipped", "path", path)
+	} else if config.OSPFMode {
+		// ── OSPF simulation mode ──
+		// Simulates how OSPF (Open Shortest Path First) works:
+		//   1. Build LSDB from gossip (like OSPF's link-state database)
+		//   2. Simulate convergence delay (OSPF: detect + flood LSA + run SPF)
+		//   3. Run Dijkstra with latency-only cost (OSPF uses single metric)
+		//   4. Install path as static FIB entry (no per-packet or mid-flight adaptation)
+		//
+		// Key differences from SPP:
+		//   - Single metric (latency only) vs intent-aware multi-metric
+		//   - All packets get the same path vs per-packet optimization
+		//   - No mid-flight rerouting vs continuous adaptation
+		//   - Convergence delay (seconds) vs immediate gossip reactivity
+		logger.Info("OSPF simulation mode",
+			"convergence_ms", config.OSPFConvergenceMs,
+		)
+
+		// Step 1: Query gossip FIRST to capture the current LSDB snapshot.
+		// Real OSPF maintains a link-state database that only updates AFTER
+		// convergence completes. By querying BEFORE the convergence delay,
+		// we simulate OSPF's pre-change LSDB — the stale view it's stuck
+		// with until Hello dead interval + LSA flood + SPF finishes.
+		logger.Info("querying gossip for OSPF LSDB (pre-convergence snapshot)", "addr", config.GossipAddr)
+		gossipTimeout := time.Duration(config.GossipTimeoutMs) * time.Millisecond
+		backoff := time.Duration(config.GossipRetryBackoffMs) * time.Millisecond
+
+		var ospfLinks []packet.Link
+		for attempt := 1; attempt <= config.GossipRetries; attempt++ {
+			gossipMap := queryGossipState(config.GossipAddr, gossipTimeout)
+			if len(gossipMap) > 0 {
+				ospfLinks = gossipMap
+				logger.Info("OSPF LSDB populated", "links", len(ospfLinks), "attempt", attempt)
+				break
+			}
+			logger.Warn("OSPF LSDB query failed",
+				"attempt", attempt,
+				"max", config.GossipRetries,
+			)
+			if attempt < config.GossipRetries {
+				time.Sleep(backoff)
+			}
+		}
+
+		if len(ospfLinks) == 0 {
+			logger.Error("OSPF LSDB empty — cannot route")
+			os.Exit(1)
+		}
+
+		// Step 2: Simulate OSPF convergence delay AFTER capturing the LSDB.
+		// Real OSPF is stuck with its pre-change LSDB during convergence.
+		// The topology may change during this window, but OSPF won't see it
+		// until convergence completes. SPP's gossip adapts in ~200ms.
+		if config.OSPFConvergenceMs > 0 {
+			convergenceDelay := time.Duration(config.OSPFConvergenceMs) * time.Millisecond
+			logger.Info("simulating OSPF convergence delay (using stale LSDB)", "delay", convergenceDelay)
+			time.Sleep(convergenceDelay)
+			// NOTE: We do NOT re-query gossip here. OSPF uses the stale snapshot
+			// captured before the delay. This is the key behavioral difference.
+		}
+
+		// Step 3: Inject sender→first-router link
+		firstRouter := config.FirstRouter
+		if firstRouter == "" {
+			nameCount := make(map[string]int)
+			for _, l := range ospfLinks {
+				nameCount[l.From]++
+			}
+			bestCount := 0
+			for name, count := range nameCount {
+				if count > bestCount {
+					bestCount = count
+					firstRouter = name
+				}
+			}
+		}
+		if firstRouter != "" {
+			ospfLinks = append(ospfLinks, packet.Link{
+				From: config.NodeName, To: firstRouter,
+				LatencyMs: 0.1, LoadPct: 0, LossPct: 0,
+			})
+		}
+
+		// Step 4: Run OSPF-style Dijkstra (latency-only, no intent)
+		graph := packet.BuildOSPFGraph(ospfLinks)
+		path = packet.Dijkstra(graph, config.NodeName, config.Destination)
+		if len(path) == 0 {
+			logger.Error("OSPF: no path found",
+				"from", config.NodeName,
+				"to", config.Destination,
+			)
+			os.Exit(1)
+		}
+
+		logger.Info("OSPF path computed",
+			"path", path,
+			"note", "single-metric (latency only), no mid-flight rerouting",
+		)
+
+		// miniMap stays empty — OSPF packets have no embedded topology,
+		// so routers CANNOT reroute them mid-flight.
 	} else {
 		// ── Dynamic mode: query gossip and run Dijkstra ──
 		logger.Info("querying gossip", "addr", config.GossipAddr)
@@ -186,7 +286,7 @@ func main() {
 		}
 
 		// ── Compute path via Dijkstra ──
-		graph := packet.BuildGraph(miniMap, intent)
+		graph := packet.BuildGraphForDest(miniMap, intent, config.Destination)
 		path = packet.Dijkstra(graph, config.NodeName, config.Destination)
 		if len(path) == 0 {
 			logger.Error("no path found to destination",
@@ -307,9 +407,8 @@ func queryGossipState(gossipAddr string, timeout time.Duration) []packet.Link {
 		return nil
 	}
 
-	var msg gossip.GossipMessage
-	dec := gob.NewDecoder(bytes.NewBuffer(buf[:n]))
-	if err := dec.Decode(&msg); err != nil {
+	msg, err := gossip.DecodeGossipMessage(buf[:n])
+	if err != nil {
 		return nil
 	}
 

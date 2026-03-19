@@ -1,9 +1,9 @@
 package gossip
 
 import (
-	"bytes"
-	"encoding/gob"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"time"
 
@@ -108,12 +108,13 @@ func (c *GossipConfig) applyDefaults() {
 
 // GossipNode manages gossip broadcasting and receiving for a single router.
 type GossipNode struct {
-	config       GossipConfig
-	state        *TopologyState
-	collector    *metrics.Collector
-	conn         *net.UDPConn
-	stopCh       chan struct{}
-	lastFullSync time.Time
+	config        GossipConfig
+	state         *TopologyState
+	collector     *metrics.Collector
+	conn          *net.UDPConn
+	stopCh        chan struct{}
+	lastFullSync  time.Time
+	resolvedAddrs map[string]*net.UDPAddr // cached neighbor DNS resolutions
 }
 
 // NewGossipNode creates a gossip node that will share topology with neighbors.
@@ -130,13 +131,24 @@ func NewGossipNode(config GossipConfig, state *TopologyState, collector *metrics
 		return nil, fmt.Errorf("listen gossip %q: %w", config.ListenAddr, err)
 	}
 
+	// Pre-resolve all neighbor addresses to avoid DNS lookups on every broadcast.
+	resolved := make(map[string]*net.UDPAddr, len(config.Neighbors))
+	for name, addrStr := range config.Neighbors {
+		nAddr, err := net.ResolveUDPAddr("udp", addrStr)
+		if err != nil {
+			return nil, fmt.Errorf("resolve neighbor %s addr %q: %w", name, addrStr, err)
+		}
+		resolved[name] = nAddr
+	}
+
 	return &GossipNode{
-		config:       config,
-		state:        state,
-		collector:    collector,
-		conn:         conn,
-		stopCh:       make(chan struct{}),
-		lastFullSync: time.Time{}, // Zero → first broadcast is full-sync.
+		config:        config,
+		state:         state,
+		collector:     collector,
+		conn:          conn,
+		stopCh:        make(chan struct{}),
+		lastFullSync:  time.Time{}, // Zero → first broadcast is full-sync.
+		resolvedAddrs: resolved,
 	}, nil
 }
 
@@ -255,18 +267,19 @@ func (g *GossipNode) broadcast() {
 		IsDelta:    isDelta,
 	}
 
-	data, err := encodeGossipMessage(msg)
+	data, err := EncodeGossipMessage(msg)
 	if err != nil {
 		log.Warn("gossip encode failed", "err", err)
 		return
 	}
 
-	for _, addrStr := range g.config.Neighbors {
-		addr, err := net.ResolveUDPAddr("udp", addrStr)
-		if err != nil {
-			continue
+	for name, addr := range g.resolvedAddrs {
+		if _, err := g.conn.WriteToUDP(data, addr); err != nil {
+			// Re-resolve on send error (address may have changed).
+			if newAddr, resolveErr := net.ResolveUDPAddr("udp", g.config.Neighbors[name]); resolveErr == nil {
+				g.resolvedAddrs[name] = newAddr
+			}
 		}
-		g.conn.WriteToUDP(data, addr)
 	}
 
 	g.state.MarkBroadcast()
@@ -300,7 +313,7 @@ func (g *GossipNode) receiveLoop() {
 			continue
 		}
 
-		msg, err := decodeGossipMessage(buf[:n])
+		msg, err := DecodeGossipMessage(buf[:n])
 		if err != nil {
 			log.Warn("gossip decode failed", "err", err)
 			continue
@@ -332,7 +345,7 @@ func (g *GossipNode) respondToMapRequest(addr *net.UDPAddr) {
 		IsDelta:    false,
 	}
 
-	data, err := encodeGossipMessage(msg)
+	data, err := EncodeGossipMessage(msg)
 	if err != nil {
 		log.Warn("MAP_REQUEST: encode failed", "err", err)
 		return
@@ -370,21 +383,181 @@ func (g *GossipNode) pruneLoop() {
 }
 
 // ──────────────────────────────────────────────────────────────
-// Gob encoding for gossip messages.
+// Compact binary encoding for gossip messages.
+//
+// Wire format (all multi-byte values are big-endian):
+//
+//   [magic: 2B] [flags: 1B] [sender_name_len: 1B] [sender_name: NB]
+//   [sent_at_nanos: 8B] [state_count: 2B]
+//   Per LinkState:
+//     [from_len: 1B] [from: NB] [to_len: 1B] [to: NB]
+//     [origin_len: 1B] [origin: NB]
+//     [latency_ms: 8B float64] [load_pct: 8B float64] [loss_pct: 8B float64]
+//     [timestamp_nanos: 8B] [sequence: 8B]
+//
+// ~50 bytes per LinkState vs ~150+ with gob. Zero reflection overhead.
 // ──────────────────────────────────────────────────────────────
 
-func encodeGossipMessage(msg GossipMessage) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(msg); err != nil {
-		return nil, fmt.Errorf("gob encode gossip: %w", err)
+const (
+	gossipMagic1 = 0x53 // 'S' for SPP
+	gossipMagic2 = 0x47 // 'G' for Gossip
+	flagIsDelta  = 0x01
+)
+
+// EncodeGossipMessage encodes a GossipMessage to compact binary format.
+func EncodeGossipMessage(msg GossipMessage) ([]byte, error) {
+	// Estimate size: header ~12B + sender + states * ~60B each.
+	est := 12 + len(msg.SenderName)
+	for _, s := range msg.States {
+		est += 3 + len(s.From) + len(s.To) + len(s.Origin) + 40
 	}
-	return buf.Bytes(), nil
+	buf := make([]byte, 0, est)
+
+	// Magic
+	buf = append(buf, gossipMagic1, gossipMagic2)
+
+	// Flags
+	var flags byte
+	if msg.IsDelta {
+		flags |= flagIsDelta
+	}
+	buf = append(buf, flags)
+
+	// Sender name
+	if len(msg.SenderName) > 255 {
+		return nil, fmt.Errorf("sender name too long: %d", len(msg.SenderName))
+	}
+	buf = append(buf, byte(len(msg.SenderName)))
+	buf = append(buf, msg.SenderName...)
+
+	// SentAt
+	buf = binary.BigEndian.AppendUint64(buf, uint64(msg.SentAt.UnixNano()))
+
+	// State count
+	if len(msg.States) > 65535 {
+		return nil, fmt.Errorf("too many states: %d", len(msg.States))
+	}
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(msg.States)))
+
+	// Each LinkState
+	for _, s := range msg.States {
+		if len(s.From) > 255 || len(s.To) > 255 || len(s.Origin) > 255 {
+			return nil, fmt.Errorf("node name too long")
+		}
+		buf = append(buf, byte(len(s.From)))
+		buf = append(buf, s.From...)
+		buf = append(buf, byte(len(s.To)))
+		buf = append(buf, s.To...)
+		buf = append(buf, byte(len(s.Origin)))
+		buf = append(buf, s.Origin...)
+		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(s.LatencyMs))
+		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(s.LoadPct))
+		buf = binary.BigEndian.AppendUint64(buf, math.Float64bits(s.LossPct))
+		buf = binary.BigEndian.AppendUint64(buf, uint64(s.Timestamp.UnixNano()))
+		buf = binary.BigEndian.AppendUint64(buf, s.Sequence)
+	}
+
+	return buf, nil
 }
 
-func decodeGossipMessage(data []byte) (GossipMessage, error) {
-	var msg GossipMessage
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&msg); err != nil {
-		return GossipMessage{}, fmt.Errorf("gob decode gossip: %w", err)
+// DecodeGossipMessage decodes a GossipMessage from compact binary format.
+func DecodeGossipMessage(data []byte) (GossipMessage, error) {
+	if len(data) < 4 {
+		return GossipMessage{}, fmt.Errorf("gossip message too short: %d bytes", len(data))
 	}
-	return msg, nil
+
+	if data[0] != gossipMagic1 || data[1] != gossipMagic2 {
+		return GossipMessage{}, fmt.Errorf("invalid gossip magic: %x%x", data[0], data[1])
+	}
+
+	off := 2
+	flags := data[off]
+	off++
+
+	// Sender name
+	senderLen := int(data[off])
+	off++
+	if off+senderLen > len(data) {
+		return GossipMessage{}, fmt.Errorf("truncated sender name")
+	}
+	senderName := string(data[off : off+senderLen])
+	off += senderLen
+
+	// SentAt
+	if off+8 > len(data) {
+		return GossipMessage{}, fmt.Errorf("truncated sent_at")
+	}
+	sentAtNanos := int64(binary.BigEndian.Uint64(data[off : off+8]))
+	off += 8
+
+	// State count
+	if off+2 > len(data) {
+		return GossipMessage{}, fmt.Errorf("truncated state count")
+	}
+	stateCount := int(binary.BigEndian.Uint16(data[off : off+2]))
+	off += 2
+
+	states := make([]LinkState, stateCount)
+	for i := 0; i < stateCount; i++ {
+		// Read 3 length-prefixed strings
+		readStr := func() (string, error) {
+			if off >= len(data) {
+				return "", fmt.Errorf("truncated string length at state %d", i)
+			}
+			sLen := int(data[off])
+			off++
+			if off+sLen > len(data) {
+				return "", fmt.Errorf("truncated string data at state %d", i)
+			}
+			s := string(data[off : off+sLen])
+			off += sLen
+			return s, nil
+		}
+
+		from, err := readStr()
+		if err != nil {
+			return GossipMessage{}, err
+		}
+		to, err := readStr()
+		if err != nil {
+			return GossipMessage{}, err
+		}
+		origin, err := readStr()
+		if err != nil {
+			return GossipMessage{}, err
+		}
+
+		// 5 × uint64 = 40 bytes
+		if off+40 > len(data) {
+			return GossipMessage{}, fmt.Errorf("truncated state %d metrics", i)
+		}
+		latencyMs := math.Float64frombits(binary.BigEndian.Uint64(data[off : off+8]))
+		off += 8
+		loadPct := math.Float64frombits(binary.BigEndian.Uint64(data[off : off+8]))
+		off += 8
+		lossPct := math.Float64frombits(binary.BigEndian.Uint64(data[off : off+8]))
+		off += 8
+		tsNanos := int64(binary.BigEndian.Uint64(data[off : off+8]))
+		off += 8
+		seq := binary.BigEndian.Uint64(data[off : off+8])
+		off += 8
+
+		states[i] = LinkState{
+			From:      from,
+			To:        to,
+			Origin:    origin,
+			LatencyMs: latencyMs,
+			LoadPct:   loadPct,
+			LossPct:   lossPct,
+			Timestamp: time.Unix(0, tsNanos),
+			Sequence:  seq,
+		}
+	}
+
+	return GossipMessage{
+		SenderName: senderName,
+		States:     states,
+		SentAt:     time.Unix(0, sentAtNanos),
+		IsDelta:    flags&flagIsDelta != 0,
+	}, nil
 }

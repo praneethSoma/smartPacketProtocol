@@ -206,24 +206,42 @@ func (sm *SystemMetrics) GetSystemLoad() float64 {
 		cpuLoad = 0
 	}
 
-	// Average load across all non-loopback interfaces.
+	// Take a single snapshot of all interfaces and compute network load
+	// inline, using one prev baseline for all interfaces.
 	allStats, err := readAllNetStats()
 	if err != nil {
 		return cpuLoad
 	}
 
+	sm.mu.Lock()
+	prevNet := sm.prevNet
+	elapsed := time.Since(sm.prevTime).Seconds()
+
 	var netLoadSum float64
 	var netCount int
-	for iface := range allStats {
+	for iface, current := range allStats {
 		if iface == sm.config.LoopbackInterface {
 			continue
 		}
-		netLoad, err := sm.GetNetworkLoad(iface)
-		if err == nil {
-			netLoadSum += netLoad
-			netCount++
+		prev, hasPrev := prevNet[iface]
+		if !hasPrev || elapsed <= 0 {
+			continue
 		}
+		rxBytesPerSec := float64(current.RxBytes-prev.RxBytes) / elapsed
+		txBytesPerSec := float64(current.TxBytes-prev.TxBytes) / elapsed
+		totalBytesPerSec := rxBytesPerSec + txBytesPerSec
+		load := (totalBytesPerSec / sm.config.LinkCapacityBps) * 100.0
+		if load > 100 {
+			load = 100
+		}
+		netLoadSum += load
+		netCount++
 	}
+
+	// Update prev snapshot once for all interfaces.
+	sm.prevNet = allStats
+	sm.prevTime = time.Now()
+	sm.mu.Unlock()
 
 	netLoadAvg := 0.0
 	if netCount > 0 {

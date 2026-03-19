@@ -29,6 +29,10 @@ type miniRouter struct {
 	// Configurable load/latency for reroute testing.
 	loadPct   float64
 	latencyMs float64
+
+	// Anti-flap: minimum time between reroutes (0 = disabled for backward compat).
+	rerouteCooldown time.Duration
+	lastRerouteTime time.Time
 }
 
 // newMiniRouter creates and starts a mini router on a random local port.
@@ -90,11 +94,13 @@ func (r *miniRouter) start(t *testing.T) {
 			// Stamp hop.
 			p.LogHop(r.name, r.loadPct, r.latencyMs)
 
-			// Check reroute.
-			if p.ShouldReroute(r.name, r.loadPct, r.latencyMs, packet.RerouteThreshold) {
+			// Check reroute (with cooldown anti-flap).
+			cooldownOk := r.rerouteCooldown == 0 || r.lastRerouteTime.IsZero() || time.Since(r.lastRerouteTime) >= r.rerouteCooldown
+			if cooldownOk && p.ShouldReroute(r.name, r.loadPct, r.latencyMs, packet.RerouteThreshold) {
 				freshLinks := r.topoState.GetFreshLinks(5 * time.Second)
 				if len(freshLinks) > 0 {
 					p.Reroute(r.name, freshLinks)
+					r.lastRerouteTime = time.Now()
 				}
 			}
 

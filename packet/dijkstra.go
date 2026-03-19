@@ -31,9 +31,10 @@ type WeightConfig struct {
 	// to avoid routing through completely broken links.
 	LossMultiplier float64
 
-	// BaseLossMultiplier is the minimum loss penalty applied regardless
-	// of reliability level. Ensures links with high loss (e.g., 100%)
-	// are always penalized. Default: 2.0.
+	// BaseLossMultiplier is the minimum loss penalty applied when
+	// reliability is below the threshold. Set to 0.0 to let
+	// low-reliability packets fully tolerate loss (enabling intent
+	// differentiation). Default: 0.5.
 	BaseLossMultiplier float64
 
 	// ReliabilityThreshold is the minimum Reliability level (inclusive)
@@ -43,26 +44,54 @@ type WeightConfig struct {
 	// StalePenaltyMultiplier is applied to edge weights when the
 	// originating node is flagged as having stale data. Default: 1.5 (50% penalty).
 	StalePenaltyMultiplier float64
+
+	// ReliabilityLoadBoost multiplies the load component when
+	// intent.Reliability >= ReliabilityThreshold, penalizing
+	// overloaded links that are more likely to drop packets.
+	// Default: 1.5.
+	ReliabilityLoadBoost float64
+
+	// HighPriorityLatencyBoost multiplies the latency component
+	// when intent.Priority >= 2 (high/critical), giving a small
+	// additional preference for lower-latency links. Default: 1.2.
+	HighPriorityLatencyBoost float64
+
+	// HopPenalty is a small constant added to every edge weight,
+	// biasing Dijkstra toward paths with fewer hops. This reflects
+	// the real-world per-hop processing overhead (~0.2ms per router).
+	// Without this, SPP may choose a 4-hop path over a 2-hop path
+	// when metrics are nearly equal, paying unnecessary overhead.
+	// Default: 0.1.
+	HopPenalty float64
 }
 
 // DefaultWeightConfig returns the standard SPP weight configuration.
 //
 // Weight formula per intent level:
 //
-//	critical (3): weight = latency×2.0 + load×1.5
-//	low      (2): weight = latency×1.5 + load×1.0
-//	normal   (1): weight = latency×1.0 + load×0.5
-//	relaxed  (0): weight = load×0.3
+//	critical (3): weight = latency×2.0 + load×0.5 + hopPenalty
+//	low      (2): weight = latency×1.5 + load×1.0 + hopPenalty
+//	normal   (1): weight = latency×1.0 + load×0.5 + hopPenalty
+//	relaxed  (0): weight = load×0.3 + hopPenalty
 //
 // If reliability ≥ 2: weight += loss × 10.0
+// If reliability < 2: weight += loss × 0.5  (tolerant — enables intent differentiation)
+//
+// LoadMultiplier[3] is intentionally low (0.5) so that latency-critical
+// packets focus on latency, not load noise. Small Docker/container load
+// fluctuations (1-5%) were causing SPP to pick longer paths that added
+// real per-hop overhead (~0.24ms/hop) to avoid negligible load differences.
 func DefaultWeightConfig() WeightConfig {
 	return WeightConfig{
 		LatencyMultiplier:      [4]float64{0.0, 1.0, 1.5, 2.0},
-		LoadMultiplier:         [4]float64{0.3, 0.5, 1.0, 1.5},
+		LoadMultiplier:         [4]float64{0.3, 0.5, 1.0, 0.5},
 		LossMultiplier:         10.0,
-		BaseLossMultiplier:     2.0,
+		BaseLossMultiplier:     0.5,
 		ReliabilityThreshold:   2,
-		StalePenaltyMultiplier: 1.5,
+		StalePenaltyMultiplier:   1.5,
+		ReliabilityLoadBoost:     1.5,
+		HighPriorityLatencyBoost: 1.2,
+		HopPenalty:               0.1,
 	}
 }
 
@@ -113,6 +142,37 @@ func BuildGraphWithConfig(links []Link, intent IntentHeader, cfg WeightConfig) m
 
 		// Ensure destination nodes exist in graph even if they
 		// have no outgoing edges (required for Dijkstra termination).
+		if _, exists := graph[link.To]; !exists {
+			graph[link.To] = []Edge{}
+		}
+	}
+	return graph
+}
+
+// BuildGraphForDest converts Links into an adjacency list, zeroing out
+// LossPct for links whose To field matches destination. The receiver
+// doesn't run probes, so its inbound links always show 100% loss in
+// gossip — this prevents that unmeasurable loss from polluting weights.
+func BuildGraphForDest(links []Link, intent IntentHeader, destination string) map[string][]Edge {
+	return BuildGraphForDestWithConfig(links, intent, destination, defaultWeightCfg)
+}
+
+// BuildGraphForDestWithConfig is the configurable variant of BuildGraphForDest.
+func BuildGraphForDestWithConfig(links []Link, intent IntentHeader, destination string, cfg WeightConfig) map[string][]Edge {
+	graph := make(map[string][]Edge, len(links))
+
+	for _, link := range links {
+		l := link
+		if l.To == destination {
+			l.LossPct = 0
+		}
+		weight := calculateWeightWithConfig(l, intent, cfg)
+
+		graph[link.From] = append(graph[link.From], Edge{
+			To:     link.To,
+			Weight: weight,
+		})
+
 		if _, exists := graph[link.To]; !exists {
 			graph[link.To] = []Edge{}
 		}
@@ -183,8 +243,21 @@ func calculateWeightWithConfig(link Link, intent IntentHeader, cfg WeightConfig)
 		latLevel = MaxLatency
 	}
 
-	weight := link.LatencyMs*cfg.LatencyMultiplier[latLevel] +
-		link.LoadPct*cfg.LoadMultiplier[latLevel]
+	latencyTerm := link.LatencyMs * cfg.LatencyMultiplier[latLevel]
+	loadTerm := link.LoadPct * cfg.LoadMultiplier[latLevel]
+
+	// High-priority packets (Priority >= 2) get additional latency sensitivity.
+	if intent.Priority >= 2 && cfg.HighPriorityLatencyBoost > 0 {
+		latencyTerm *= cfg.HighPriorityLatencyBoost
+	}
+
+	// Reliability-critical packets penalize overloaded links more heavily,
+	// since high load correlates with packet drops.
+	if intent.Reliability >= cfg.ReliabilityThreshold && cfg.ReliabilityLoadBoost > 0 {
+		loadTerm *= cfg.ReliabilityLoadBoost
+	}
+
+	weight := latencyTerm + loadTerm + cfg.HopPenalty
 
 	// Always apply a base loss penalty so Dijkstra avoids broken links
 	// (e.g., 100% loss). Higher reliability levels get a stronger penalty.
@@ -218,6 +291,40 @@ func Dijkstra(graph map[string][]Edge, start, end string) []string {
 // The start and end nodes are never excluded regardless of the set.
 func DijkstraExcluding(graph map[string][]Edge, start, end string, exclude map[string]bool) []string {
 	return dijkstraCore(graph, start, end, exclude)
+}
+
+// ──────────────────────────────────────────────────────────────
+// OSPF-style graph — single metric, no intent awareness.
+//
+// Real OSPF uses cost = reference_bandwidth / interface_bandwidth.
+// Since SPP measures latency rather than bandwidth, we use latency
+// as the sole metric. This matches OSPF's fundamental design:
+// one metric per link, same cost for all traffic classes.
+// ──────────────────────────────────────────────────────────────
+
+// BuildOSPFGraph converts links into an adjacency list using OSPF-style
+// single-metric weights. Unlike BuildGraph, this ignores:
+//   - Intent headers (all packets get the same path)
+//   - Load metrics (OSPF doesn't consider load)
+//   - Loss metrics (OSPF doesn't consider packet loss)
+//
+// Only latency is used, with a minimum cost of 1.0 to avoid zero-weight edges.
+func BuildOSPFGraph(links []Link) map[string][]Edge {
+	graph := make(map[string][]Edge, len(links))
+	for _, link := range links {
+		weight := link.LatencyMs
+		if weight < 1.0 {
+			weight = 1.0 // OSPF minimum cost
+		}
+		graph[link.From] = append(graph[link.From], Edge{
+			To:     link.To,
+			Weight: weight,
+		})
+		if _, exists := graph[link.To]; !exists {
+			graph[link.To] = []Edge{}
+		}
+	}
+	return graph
 }
 
 // dijkstraCore is the shared Dijkstra implementation.
@@ -270,11 +377,17 @@ func dijkstraCore(graph map[string][]Edge, start, end string, exclude map[string
 	}
 
 	// Reconstruct path by walking backward from end to start.
-	path := []string{}
+	// Build in reverse order then flip — O(n) instead of O(n²) prepend.
+	path := make([]string, 0, 8)
 	current := end
 	for current != "" {
-		path = append([]string{current}, path...)
+		path = append(path, current)
 		current = prev[current]
+	}
+
+	// Reverse in-place.
+	for i, j := 0, len(path)-1; i < j; i, j = i+1, j-1 {
+		path[i], path[j] = path[j], path[i]
 	}
 
 	if len(path) > 0 && path[0] == start {

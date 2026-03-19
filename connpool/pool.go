@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 // UDPPool is a thread-safe pool of persistent UDP connections,
@@ -32,6 +33,7 @@ func (p *UDPPool) Send(addr string, data []byte) error {
 		return fmt.Errorf("connpool dial %s: %w", addr, err)
 	}
 
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Millisecond))
 	_, err = conn.Write(data)
 	if err == nil {
 		return nil
@@ -45,6 +47,7 @@ func (p *UDPPool) Send(addr string, data []byte) error {
 	}
 	p.put(addr, conn)
 
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Millisecond))
 	if _, err = conn.Write(data); err != nil {
 		return fmt.Errorf("connpool retry write %s: %w", addr, err)
 	}
@@ -72,7 +75,14 @@ func (p *UDPPool) getOrDial(addr string) (*net.UDPConn, error) {
 		return conn, nil
 	}
 
-	// Not cached — take write lock and double-check.
+	// Not cached — resolve address before acquiring write lock
+	// to avoid blocking other goroutines during DNS resolution.
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", addr, err)
+	}
+
+	// Take write lock and double-check.
 	p.mu.Lock()
 	conn, ok = p.conns[addr]
 	if ok {
@@ -80,11 +90,11 @@ func (p *UDPPool) getOrDial(addr string) (*net.UDPConn, error) {
 		return conn, nil
 	}
 
-	// Still not cached — dial under the write lock.
-	newConn, err := p.dial(addr)
+	// Still not cached — dial with pre-resolved address.
+	newConn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
 		p.mu.Unlock()
-		return nil, err
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
 	p.conns[addr] = newConn
 	p.mu.Unlock()

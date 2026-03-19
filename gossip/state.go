@@ -3,6 +3,7 @@ package gossip
 import (
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"time"
 
@@ -66,6 +67,7 @@ type LinkState struct {
 	LoadPct   float64
 	LossPct   float64
 	Timestamp time.Time // When this measurement was taken
+	Origin    string    // Node that originally measured this link
 	Sequence  uint64    // Monotonic counter to detect ordering
 }
 
@@ -106,8 +108,17 @@ func (ts *TopologyState) UpdateLocal(from, to string, latencyMs, loadPct, lossPc
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
-	ts.seqGen++
 	key := LinkKey{From: from, To: to}
+
+	// Only flag changes if the new values differ significantly from
+	// the previous ones (avoids float jitter keeping gossip in fast mode).
+	prev, existed := ts.links[key]
+	significant := !existed ||
+		significantChange(latencyMs, prev.LatencyMs, 0.5) ||
+		significantChange(loadPct, prev.LoadPct, 1.0) ||
+		significantChange(lossPct, prev.LossPct, 1.0)
+
+	ts.seqGen++
 	ts.links[key] = LinkState{
 		From:      from,
 		To:        to,
@@ -115,9 +126,12 @@ func (ts *TopologyState) UpdateLocal(from, to string, latencyMs, loadPct, lossPc
 		LoadPct:   loadPct,
 		LossPct:   lossPct,
 		Timestamp: time.Now(),
+		Origin:    from,
 		Sequence:  ts.seqGen,
 	}
-	ts.hasChanges = true
+	if significant {
+		ts.hasChanges = true
+	}
 }
 
 // MergeRemote merges link states received from a neighbor.
@@ -133,9 +147,16 @@ func (ts *TopologyState) MergeRemote(states []LinkState) int {
 		key := LinkKey{From: incoming.From, To: incoming.To}
 		existing, exists := ts.links[key]
 
-		// Accept if: new link, newer sequence, or newer timestamp from same source.
-		if !exists || incoming.Sequence > existing.Sequence ||
-			(incoming.From == existing.From && incoming.Timestamp.After(existing.Timestamp)) {
+		// Accept if: new link, or same origin with newer sequence, or different origin with newer timestamp.
+		accept := false
+		if !exists {
+			accept = true
+		} else if incoming.Origin == existing.Origin {
+			accept = incoming.Sequence > existing.Sequence
+		} else {
+			accept = incoming.Timestamp.After(existing.Timestamp)
+		}
+		if accept {
 			ts.links[key] = incoming
 			updated++
 			ts.hasChanges = true
@@ -229,6 +250,46 @@ func (ts *TopologyState) GetLinksWithStaleness(warnAge, maxAge time.Duration) []
 	return result
 }
 
+// CheckDivergence checks if any link from currentNode has conditions that
+// diverge from the given actual values by more than threshold percent.
+// Returns true if rerouting may be needed. This is a read-locked O(neighbors)
+// check with zero allocations — use it as a fast pre-filter before GetFreshLinks.
+func (ts *TopologyState) CheckDivergence(currentNode string, actualLoad, actualLatency, threshold, minLoadDiff, minLatencyDiff float64) bool {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	for key, state := range ts.links {
+		if key.From != currentNode {
+			continue
+		}
+
+		// Check load divergence with absolute floor.
+		loadDiff := math.Abs(actualLoad - state.LoadPct)
+		if loadDiff >= minLoadDiff {
+			if state.LoadPct > 0 {
+				if (loadDiff/state.LoadPct)*100 > threshold {
+					return true
+				}
+			} else if actualLoad > 10.0 { // DefaultSignificantLatencyMs equivalent
+				return true
+			}
+		}
+
+		// Check latency divergence with absolute floor.
+		latDiff := math.Abs(actualLatency - state.LatencyMs)
+		if latDiff >= minLatencyDiff {
+			if state.LatencyMs > 0 {
+				if (latDiff/state.LatencyMs)*100 > threshold {
+					return true
+				}
+			} else if actualLatency > 10.0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Size returns the number of known links.
 func (ts *TopologyState) Size() int {
 	ts.mu.RLock()
@@ -266,9 +327,9 @@ func (ts *TopologyState) GetChangedStates() []LinkState {
 		prev, existed := ts.lastBroadcast[key]
 		if !existed ||
 			current.Sequence != prev.Sequence ||
-			current.LatencyMs != prev.LatencyMs ||
-			current.LoadPct != prev.LoadPct ||
-			current.LossPct != prev.LossPct {
+			significantChange(current.LatencyMs, prev.LatencyMs, 0.5) ||
+			significantChange(current.LoadPct, prev.LoadPct, 1.0) ||
+			significantChange(current.LossPct, prev.LossPct, 1.0) {
 			changed = append(changed, current)
 		}
 	}
@@ -294,4 +355,11 @@ func (ts *TopologyState) HasChanges() bool {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	return ts.hasChanges
+}
+
+// significantChange returns true if the absolute difference between
+// a and b exceeds the given threshold. Used to avoid treating tiny
+// float jitter as meaningful topology changes.
+func significantChange(a, b, threshold float64) bool {
+	return math.Abs(a-b) > threshold
 }
